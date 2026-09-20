@@ -1,0 +1,28 @@
+{
+  "name": "claude-logout",
+  "version": "1.0.0",
+  "description": "Playwright bot that checks Claude active sessions every minute and terminates sessions not from Mumbai, Navi Mumbai, Bergen, or Panvel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "bot": "node index.js",
+    "bot:dry-run": "node index.js --dry-run",
+    "bot:30s": "node index.js --interval 30",
+    "once": "node index.js --once",
+    "dry-run": "node index.js --dry-run --once",
+    "connect": "node index.js --cdp 9222",
+    "test": "node -e 'require(\"./index.js\"); console.log(\"Syntax OK\")'"
+  },
+  "keywords": [
+    "claude",
+    "playwright",
+    "session-manager",
+    "security-bot",
+    "active-sessions"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}

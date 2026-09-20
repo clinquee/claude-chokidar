@@ -1,0 +1,5 @@
+node_modules/
+chrome_session/
+.DS_Store
+__pycache__/
+*.log
