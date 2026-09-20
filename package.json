@@ -11,7 +11,10 @@
     "once": "node index.js --once",
     "dry-run": "node index.js --dry-run --once",
     "connect": "node index.js --cdp 9222",
-    "test": "node -e 'require(\"./index.js\"); console.log(\"Syntax OK\")'"
+    "test": "node -e 'require(\"./index.js\"); console.log(\"Syntax OK\")'",
+    "chrome:debug": "node launch-chrome-debug.js",
+    "profiles": "node index.js --list-profiles",
+    "session-key": "node save-session-key.js"
   },
   "keywords": [
     "claude",

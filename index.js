@@ -4,30 +4,50 @@
  * Claude Active Sessions Manager (Playwright) - Every-Minute Bot
  *
  * Continuously monitors active Claude sessions and terminates any session
- * not located in allowed locations (default: Mumbai, Navi Mumbai, Bergen).
- * Never terminates the current active session.
+ * not located in a protected location. Runs on the locally installed Chrome
+ * (chrome.exe), never on Playwright's bundled Chromium.
+ *
+ * Safety model: a session is terminated only when its location is read
+ * successfully AND is not protected. Anything unclear - blank location,
+ * unreadable row, the current session, a table that looks wrong - is kept.
  */
 
 const { chromium } = require('playwright');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { spawn, execFileSync } = require('child_process');
+const chromeProfile = require('./chromeProfile');
 
-// Default allowed locations (case-insensitive substring match)
-const DEFAULT_ALLOWED_LOCATIONS = ['mumbai', 'navi mumbai', 'bergen', 'panvel'];
+// Locations that are ALWAYS protected. These can never be removed by --allow;
+// --allow only adds more. Matching is case-insensitive substring matching, so
+// "Mumbai, Maharashtra, IN" and "Bergen, Vestland, NO" both match.
+const PROTECTED_LOCATIONS = ['mumbai', 'navi mumbai', 'bergen', 'panvel'];
+
+// Chrome profile used by default (matched against profile dir, display name or
+// account email in Chrome's "Local State").
+const DEFAULT_CHROME_PROFILE = 'shreyans.tatiya@gmail.com';
 
 // Parse command line arguments
 function parseArgs() {
   const args = process.argv.slice(2);
   const options = {
     dryRun: false,
-    allowedLocations: [...DEFAULT_ALLOWED_LOCATIONS],
+    allowedLocations: [...PROTECTED_LOCATIONS],
     cdpPort: null,
     userDataDir: path.resolve(__dirname, 'chrome_session'),
     headless: false,
     interval: 60, // Default 60 seconds (1 minute)
     once: false,
-    help: false
+    help: false,
+    chromePath: null,                        // Path to chrome.exe (auto-detected)
+    chromeProfile: DEFAULT_CHROME_PROFILE,   // Which local Chrome profile to use
+    useRealProfile: true,                    // Drive the real Chrome profile when possible
+    sessionKey: null,                        // claude.ai sessionKey cookie to reuse
+    listProfiles: false,                     // Print local Chrome profiles and exit
+    forgetSelf: false,                       // Re-pin which session belongs to the bot
+    selfSession: null,                       // The bot's own session row (never terminated)
+    botStartedAt: Date.now()
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -49,8 +69,24 @@ function parseArgs() {
     } else if (arg === '--allow' || arg === '-a') {
       const val = args[++i];
       if (val) {
-        options.allowedLocations = val.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        // --allow ADDS locations. The protected ones can never be dropped.
+        const extra = val.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        options.allowedLocations = [...new Set([...PROTECTED_LOCATIONS, ...extra])];
       }
+    } else if (arg === '--chrome-path') {
+      options.chromePath = args[++i] || null;
+    } else if (arg.startsWith('--chrome-path=')) {
+      options.chromePath = arg.split('=').slice(1).join('=');
+    } else if (arg === '--chrome-profile') {
+      options.chromeProfile = args[++i] || DEFAULT_CHROME_PROFILE;
+    } else if (arg.startsWith('--chrome-profile=')) {
+      options.chromeProfile = arg.split('=').slice(1).join('=');
+    } else if (arg === '--session-key') {
+      options.sessionKey = args[++i] || null;
+    } else if (arg.startsWith('--session-key=')) {
+      options.sessionKey = arg.split('=').slice(1).join('=');
+    } else if (arg === '--separate-profile' || arg === '--no-real-profile') {
+      options.useRealProfile = false;
     } else if (arg === '--cdp') {
       options.cdpPort = args[++i] || '9222';
     } else if (arg.startsWith('--cdp=')) {
@@ -61,6 +97,10 @@ function parseArgs() {
       options.userDataDir = path.resolve(arg.split('=')[1]);
     } else if (arg === '--headless') {
       options.headless = true;
+    } else if (arg === '--forget-self') {
+      options.forgetSelf = true;
+    } else if (arg === '--list-profiles') {
+      options.listProfiles = true;
     } else if (arg === '--help' || arg === '-h') {
       options.help = true;
     }
@@ -77,15 +117,26 @@ Claude Active Sessions Terminator Bot (Playwright)
 Usage:
   node index.js [options]
 
+Always-protected locations (can never be terminated, cannot be disabled):
+  ${PROTECTED_LOCATIONS.join(', ')}
+
 Options:
   --interval, -i <sec>      Check interval in seconds (default: 60 = 1 minute bot)
   --once                    Run a single scan and exit (disables recurring bot loop)
   --dry-run                 Preview sessions without actually terminating them
-  --allow, -a <locations>   Comma-separated list of allowed locations (case-insensitive)
-                            Default: "mumbai,navi mumbai,bergen,panvel"
-  --cdp [port]              Connect to an already running browser with remote debugging (e.g. 9222)
+  --allow, -a <locations>   Extra protected locations, comma-separated (case-insensitive).
+                            These are ADDED to the always-protected list above.
+  --chrome-profile <name>   Local Chrome profile: folder name, display name or account
+                            email (default: "${DEFAULT_CHROME_PROFILE}")
+  --chrome-path <exe>       Path to chrome.exe (default: auto-detected local install)
+  --session-key <value>     Reuse your existing claude.ai session cookie instead of
+                            logging in again (also read from session-key.txt)
+  --separate-profile        Skip the real Chrome profile; use ./chrome_session only
+  --cdp [port]              Attach to a Chrome already running with remote debugging (e.g. 9222)
   --user-data-dir <dir>     Directory to persist browser login data (default: ./chrome_session)
   --headless                Run in headless mode (recommended after initial login is saved)
+  --forget-self             Forget which session is the bot's own and re-pin it
+  --list-profiles           List the local Chrome profiles and exit
   -h, --help                Show this help message
 
 Examples:
@@ -101,9 +152,32 @@ Examples:
   # 4. Single-run scan and exit:
   node index.js --once
 
-  # 5. Connect to already running Chrome on port 9222:
+  # 5. Attach to your own Chrome started with a debug port:
+  npm run chrome:debug      (in another terminal)
   node index.js --cdp 9222
 `);
+}
+
+// Claude's account settings page, where the active-session table lives.
+const SETTINGS_URL = 'https://claude.ai/settings/account';
+
+// Strict signed-in probe: the login page must not be showing AND the account
+// page content must actually be present. A loose check here previously made the
+// bot believe a signed-out profile was authenticated.
+async function isSignedIn(page) {
+  const url = page.url();
+  if (url.includes('/login') || url.includes('/magic-link') || url.includes('/onboarding')) return false;
+  if ((await page.title().catch(() => '')).includes('Just a moment')) return false;
+
+  const markers = [
+    'text=Active sessions',
+    'text=Log out of all devices',
+    '[data-testid="user-menu-button"]'
+  ];
+  for (const marker of markers) {
+    if (await page.locator(marker).first().isVisible().catch(() => false)) return true;
+  }
+  return false;
 }
 
 // Check if a local port has an active HTTP server (e.g. Chrome Remote Debugging)
@@ -120,11 +194,122 @@ function isPortOpen(port) {
   });
 }
 
-// Check if a location string matches any of the allowed locations
+// Check if a location string matches any of the allowed locations.
+// The always-protected list is checked too, even if a caller passes a narrower list.
 function isLocationAllowed(location, allowedLocations) {
   if (!location) return false;
   const locLower = location.toLowerCase();
-  return allowedLocations.some(allowed => locLower.includes(allowed.toLowerCase()));
+  const list = [...new Set([...PROTECTED_LOCATIONS, ...(allowedLocations || [])])];
+  return list.some(allowed => locLower.includes(String(allowed).toLowerCase()));
+}
+
+/**
+ * The bot's own browser shows up in the session list as an ordinary device,
+ * from wherever this machine's connection geolocates - which is usually NOT one
+ * of the protected locations. Without pinning it, the bot would terminate its
+ * own session, get logged out, sign in again, and repeat forever.
+ *
+ * So the row the bot created is recorded on first run and protected from then
+ * on. State is keyed by profile directory and lives in bot-session.json.
+ */
+const SELF_STATE_FILE = path.join(__dirname, 'bot-session.json');
+
+function loadSelfState() {
+  try {
+    return JSON.parse(fs.readFileSync(SELF_STATE_FILE, 'utf8'));
+  } catch (e) {
+    return {};
+  }
+}
+
+function getSelfSession(userDataDir) {
+  const state = loadSelfState();
+  return state[userDataDir] || null;
+}
+
+function setSelfSession(userDataDir, row) {
+  const state = loadSelfState();
+  state[userDataDir] = row;
+  try {
+    fs.writeFileSync(SELF_STATE_FILE, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  } catch (e) {}
+}
+
+function clearSelfSession(userDataDir) {
+  const state = loadSelfState();
+  delete state[userDataDir];
+  try {
+    fs.writeFileSync(SELF_STATE_FILE, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  } catch (e) {}
+}
+
+function isSelfSession(row, self) {
+  if (!self) return false;
+  return row.deviceText === self.deviceText &&
+         row.locationText === self.locationText &&
+         row.createdText === self.createdText;
+}
+
+// The device string Claude shows for a browser running on this OS.
+function ownPlatformToken() {
+  if (process.platform === 'win32') return 'windows';
+  if (process.platform === 'darwin') return 'mac';
+  return 'linux';
+}
+
+/**
+ * Pick the row that is this bot's own session: same platform as this machine,
+ * and created around the time the bot signed in.
+ */
+function findOwnRow(rows, botStartedAt, windowMs = 15 * 60 * 1000) {
+  let best = null;
+  let bestDelta = Infinity;
+
+  for (const row of rows) {
+    if (!row.deviceText.toLowerCase().includes(ownPlatformToken())) continue;
+    const created = Date.parse(row.createdText);
+    if (Number.isNaN(created)) continue;
+    const delta = Math.abs(created - botStartedAt);
+    if (delta <= windowMs && delta < bestDelta) {
+      best = row;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+/**
+ * Decide what to do with one session row - deliberately biased towards keeping.
+ * Returns { keep: boolean, reason: string }.
+ */
+function classifySession({ deviceText, locationText, createdText, isCurrent }, allowedLocations, self) {
+  if (isCurrent) {
+    return { keep: true, reason: 'Current session' };
+  }
+
+  if (isSelfSession({ deviceText, locationText, createdText }, self)) {
+    return { keep: true, reason: "This bot's own session" };
+  }
+
+  const location = (locationText || '').replace(/\s+/g, ' ').trim();
+
+  // Fail-safe: a row whose location did not render (slow load, layout change,
+  // extra column) must never be terminated - we simply do not know where it is.
+  if (!location || location === '-' || location === '--') {
+    return { keep: true, reason: 'Location unknown - kept for safety' };
+  }
+
+  if (isLocationAllowed(location, allowedLocations)) {
+    return { keep: true, reason: 'Protected location' };
+  }
+
+  // Equally fail-safe: if the device column is empty the row probably is not a
+  // real session row (spacer/header row), so leave it alone.
+  if (!(deviceText || '').trim()) {
+    return { keep: true, reason: 'Row not readable - kept for safety' };
+  }
+
+  return { keep: false, reason: `Location "${location}" is not protected` };
 }
 
 // Format timestamp helper
@@ -137,9 +322,52 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Return the first locator in `candidates` that becomes visible, else null.
+// Used instead of one comma-joined selector, which Playwright rejects when it
+// mixes CSS with a `text=` engine.
+async function firstVisible(page, candidates, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const candidate of candidates) {
+      const first = candidate.first();
+      if (await first.isVisible().catch(() => false)) return first;
+    }
+    await page.waitForTimeout(200);
+  }
+  return null;
+}
+
+// Read every session row's text in one pass (device, location, created).
+async function readAllRows(page) {
+  const rows = await page.locator('table tr').all();
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const cells = await rows[i].locator('th, td').all();
+    if (cells.length < 2) continue;
+    out.push({
+      deviceText: (await cells[0].innerText().catch(() => '')).trim(),
+      locationText: (await cells[1].innerText().catch(() => '')).trim(),
+      createdText: cells.length >= 3 ? (await cells[2].innerText().catch(() => '')).trim() : ''
+    });
+  }
+  return out;
+}
+
+// Re-read a row's cells straight from the live DOM (used right before acting).
+async function rereadRow(row) {
+  const cells = await row.locator('th, td').all();
+  if (cells.length < 2) return null;
+  const deviceText = (await cells[0].innerText().catch(() => '')).trim();
+  const locationText = (await cells[1].innerText().catch(() => '')).trim();
+  const isCurrent = deviceText.toLowerCase().includes('current') ||
+                    (await row.locator('text=Current').count()) > 0 ||
+                    (await row.locator('button[aria-label*="current session"]').count()) > 0;
+  return { deviceText, locationText, isCurrent };
+}
+
 // Perform a single scan and termination pass
 async function performScan(page, options, checkNumber) {
-  const settingsUrl = 'https://claude.ai/new#settings/account';
+  const settingsUrl = SETTINGS_URL;
   const time = getTimestamp();
 
   console.log(`\n[${time}] Check #${checkNumber}: Inspecting active sessions...`);
@@ -147,7 +375,7 @@ async function performScan(page, options, checkNumber) {
   // Ensure settings account page is loaded and fresh
   try {
     const currentUrl = page.url();
-    if (!currentUrl.includes('settings/account')) {
+    if (!currentUrl.includes('/settings/account')) {
       await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } else {
       // Reload page to get fresh session data from server
@@ -180,6 +408,23 @@ async function performScan(page, options, checkNumber) {
     await page.waitForTimeout(1000);
   } catch (e) {}
 
+  // On the first pass, work out which row is this bot's own browser and pin it,
+  // so the bot can never terminate the session it is itself using.
+  if (!options.selfSession) {
+    const snapshot = await readAllRows(page);
+    const own = findOwnRow(snapshot, options.botStartedAt || Date.now());
+    if (own) {
+      options.selfSession = {
+        deviceText: own.deviceText,
+        locationText: own.locationText,
+        createdText: own.createdText
+      };
+      setSelfSession(options.userDataDir, options.selfSession);
+      console.log(`  [SELF]  Pinned this bot's own session: ${own.deviceText} | ${own.locationText || 'N/A'} | ${own.createdText}`);
+      console.log('          It will never be terminated. Re-pin with --forget-self.');
+    }
+  }
+
   let terminatedCount = 0;
   let keptCount = 0;
   const processedKeys = new Set();
@@ -195,6 +440,8 @@ async function performScan(page, options, checkNumber) {
 
     let rowToTerminate = null;
     let sessionDetails = null;
+    let readableRows = 0;
+    let keepableRows = 0;
 
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
@@ -210,31 +457,33 @@ async function performScan(page, options, checkNumber) {
                         (await row.locator('button[aria-label*="current session"]').count()) > 0;
 
       const sessionKey = `${deviceText}_${locationText}_${createdText}`;
+      const verdict = classifySession({ deviceText, locationText, createdText, isCurrent }, options.allowedLocations, options.selfSession);
 
-      // Always keep current session
-      if (isCurrent) {
+      readableRows++;
+      if (verdict.keep) keepableRows++;
+
+      if (verdict.keep) {
         if (!processedKeys.has(sessionKey)) {
-          console.log(`  [KEEP]  ${deviceText.replace(/\n/g, ' ')} | Location: ${locationText || 'N/A'} (Current Session)`);
+          console.log(`  [KEEP]  ${deviceText.replace(/\n/g, ' ')} | Location: ${locationText || 'N/A'} | ${verdict.reason}`);
           processedKeys.add(sessionKey);
           keptCount++;
         }
         continue;
       }
 
-      // Check allowed locations
-      const allowed = isLocationAllowed(locationText, options.allowedLocations);
-      if (allowed) {
-        if (!processedKeys.has(sessionKey)) {
-          console.log(`  [KEEP]  ${deviceText} | Location: ${locationText} | Created: ${createdText}`);
-          processedKeys.add(sessionKey);
-          keptCount++;
-        }
-        continue;
+      // Unauthorized session found - remember it, but only act after the whole
+      // table has been read, so the sanity check below can veto it.
+      if (!rowToTerminate) {
+        rowToTerminate = row;
+        sessionDetails = { deviceText, locationText, createdText, sessionKey, reason: verdict.reason };
       }
+    }
 
-      // Unauthorized session found!
-      rowToTerminate = row;
-      sessionDetails = { deviceText, locationText, createdText, sessionKey };
+    // Runaway guard: on a healthy account at least the current session is kept.
+    // If the page says every single row should go, the table was most likely
+    // misread (layout change, half-rendered page) - do nothing this round.
+    if (rowToTerminate && readableRows > 1 && keepableRows === 0) {
+      console.warn('  [ABORT] Every row looked unprotected, which is almost certainly a misread page. Nothing terminated.');
       break;
     }
 
@@ -248,6 +497,24 @@ async function performScan(page, options, checkNumber) {
         // In dry run, move on to remaining rows without terminating
         continueScanning = false;
       } else {
+        // Last-moment re-read: the table may have re-rendered between reading
+        // the row and acting on it. Only proceed if the row still says the same
+        // thing and still classifies as unprotected.
+        const recheck = await rereadRow(rowToTerminate).catch(() => null);
+        if (!recheck) {
+          console.warn('  [SKIP] Row vanished before termination - re-scanning next round.');
+          continueScanning = true;
+          continue;
+        }
+        const recheckVerdict = classifySession({ ...recheck, createdText }, options.allowedLocations, options.selfSession);
+        if (recheckVerdict.keep || recheck.locationText !== locationText || recheck.deviceText !== deviceText) {
+          console.warn(`  [SKIP] Row changed on re-check (now "${recheck.deviceText}" @ "${recheck.locationText}" - ${recheckVerdict.reason}). Not terminating.`);
+          processedKeys.add(sessionKey);
+          keptCount++;
+          continueScanning = true;
+          continue;
+        }
+
         console.log(`  [TERMINATING] ${deviceText} | Location: ${locationText || 'Unknown'} | Created: ${createdText}...`);
 
         try {
@@ -256,8 +523,19 @@ async function performScan(page, options, checkNumber) {
           await actionBtn.click();
           await page.waitForTimeout(500);
 
-          const terminateItem = page.locator('[role="menuitem"]:has-text("Terminate"), [role="menu"] button:has-text("Terminate"), [data-part="item"]:has-text("Terminate"), text=Terminate').first();
-          await terminateItem.waitFor({ state: 'visible', timeout: 5000 });
+          // Playwright rejects a selector list that mixes CSS with a `text=`
+          // engine, so each candidate is tried as its own locator.
+          const terminateItem = await firstVisible(page, [
+            page.getByRole('menuitem', { name: /terminate/i }),
+            page.locator('[role="menu"] button').filter({ hasText: /terminate/i }),
+            page.locator('[role="menuitem"]:has-text("Terminate")'),
+            page.locator('[data-part="item"]:has-text("Terminate")'),
+            page.getByText('Terminate', { exact: false })
+          ], 5000);
+
+          if (!terminateItem) {
+            throw new Error('No "Terminate" menu item appeared.');
+          }
           await terminateItem.click();
           await page.waitForTimeout(500);
 
@@ -298,10 +576,10 @@ async function performScan(page, options, checkNumber) {
       if (processedKeys.has(sessionKey)) continue;
 
       const isCurrent = deviceText.toLowerCase().includes('current') || (await row.locator('text=Current').count()) > 0;
-      const allowed = isLocationAllowed(locationText, options.allowedLocations);
+      const verdict = classifySession({ deviceText, locationText, createdText, isCurrent }, options.allowedLocations, options.selfSession);
 
-      if (isCurrent || allowed) {
-        console.log(`  [KEEP]  ${deviceText.replace(/\n/g, ' ')} | Location: ${locationText || 'N/A'}`);
+      if (verdict.keep) {
+        console.log(`  [KEEP]  ${deviceText.replace(/\n/g, ' ')} | Location: ${locationText || 'N/A'} | ${verdict.reason}`);
         keptCount++;
       } else {
         console.log(`  [WOULD TERMINATE] ${deviceText} | Location: ${locationText || 'Unknown'} | Created: ${createdText}`);
@@ -311,10 +589,309 @@ async function performScan(page, options, checkNumber) {
     }
   }
 
-  const total = processedKeys.length;
+  const total = processedKeys.size;
   console.log(`[${time}] Check complete. Total: ${total} | Kept: ${keptCount} | ${options.dryRun ? 'Flagged' : 'Terminated'}: ${terminatedCount}`);
 
   return { scanned: total, kept: keptCount, terminated: terminatedCount };
+}
+
+// Read a saved claude.ai sessionKey (so the bot reuses your existing session
+// instead of signing in again and creating another device entry).
+/**
+ * Parse whatever was pasted into a list of cookies.
+ *
+ * claude.ai uses several session cookies side by side (sessionKey,
+ * sessionKeyV3, and their *LC variants), so rather than guessing which one is
+ * authoritative this accepts any of these shapes:
+ *   - a bare value                      -> treated as sessionKey
+ *   - "sessionKey=abc; sessionKeyV3=de" -> a whole Cookie header
+ *   - one "name=value" (or "name<TAB>value") per line
+ */
+function parseSessionCookies(raw) {
+  if (!raw) return [];
+  // Strip a UTF-16/UTF-8 BOM: PowerShell's ">" redirection writes UTF-16 files.
+  const text = String(raw).replace(/^﻿/, '').replace(/\u0000/g, '');
+
+  const chunks = text
+    .split(/[\r\n;]+/)
+    .map(part => part.trim())
+    .filter(part => part && !part.startsWith('#'));
+
+  const cookies = [];
+  for (const chunk of chunks) {
+    const match = chunk.match(/^["']?([A-Za-z0-9_.\-]+)["']?\s*[=\t:]\s*["']?(.+?)["']?$/);
+    if (match) {
+      cookies.push({ name: match[1], value: match[2].trim() });
+    } else if (!/\s/.test(chunk)) {
+      // A bare value with no name: that is the classic sessionKey cookie.
+      cookies.push({ name: 'sessionKey', value: chunk.replace(/^["']|["']$/g, '') });
+    }
+  }
+
+  // Keep only session cookies, last occurrence of each name wins.
+  const byName = new Map();
+  for (const cookie of cookies) {
+    if (!/^sessionKey/i.test(cookie.name)) continue;
+    if (cookie.value) byName.set(cookie.name, cookie.value);
+  }
+  return [...byName.entries()].map(([name, value]) => ({ name, value }));
+}
+
+// Minimal .env reader (no dependency): KEY=value lines, # comments, optional quotes.
+function loadDotEnv(file) {
+  const env = {};
+  if (!fs.existsSync(file)) return env;
+  const text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 1) continue;
+    const key = trimmed.slice(0, eq).trim().replace(/^export\s+/, '');
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+    if (key && value) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Map a .env key to the claude.ai cookie it holds:
+ *   SESSION_KEY        -> sessionKey
+ *   SESSION_KEYLC      -> sessionKeyLC
+ *   SESSION_KEYV3      -> sessionKeyV3
+ *   SESSION_KEYV3LC    -> sessionKeyV3LC
+ * A trailing _v2 / _2 marks a second value for the same cookie name (claude.ai
+ * lists some of these twice, once host-only and once domain-wide).
+ */
+function cookieNameFromEnvKey(key) {
+  const match = key.match(/^SESSION_KEY([A-Za-z0-9]*?)(?:_v?\d+)?$/i);
+  if (!match) return null;
+  return 'sessionKey' + (match[1] || '').toUpperCase();
+}
+
+function cookiesFromEnv(env) {
+  const cookies = [];
+  for (const [key, value] of Object.entries(env)) {
+    const name = cookieNameFromEnvKey(key);
+    if (name && value) cookies.push({ name, value, envKey: key });
+  }
+  return cookies;
+}
+
+// Returns the cookies to inject, or [] when nothing has been configured.
+// Order of precedence: --session-key, CLAUDE_SESSION_KEY, session-key.txt, .env.
+function readSessionCookies(explicit) {
+  if (explicit) return parseSessionCookies(explicit);
+  if (process.env.CLAUDE_SESSION_KEY) return parseSessionCookies(process.env.CLAUDE_SESSION_KEY);
+
+  const file = path.join(__dirname, 'session-key.txt');
+  if (fs.existsSync(file)) {
+    const fromFile = parseSessionCookies(fs.readFileSync(file, 'utf8'));
+    if (fromFile.length) return fromFile;
+  }
+
+  const fromDotEnv = cookiesFromEnv(loadDotEnv(path.join(__dirname, '.env')));
+  if (fromDotEnv.length) return fromDotEnv;
+
+  return cookiesFromEnv(process.env);
+}
+
+// Backwards-compatible single-key accessor.
+function readSessionKey(explicit) {
+  const cookies = readSessionCookies(explicit);
+  return cookies.length ? cookies[0].value : null;
+}
+
+async function applySessionCookies(context, cookies) {
+  const expires = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365;
+
+  // claude.ai lists some of these cookies twice - once host-only (claude.ai)
+  // and once domain-wide (.claude.ai). When two values are supplied for one
+  // name, the first takes the domain-wide slot and the second the host-only
+  // one; a single value is written to both so the shape cannot be wrong.
+  const byName = new Map();
+  for (const { name, value } of cookies) {
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(value);
+  }
+
+  const payload = [];
+  for (const [name, values] of byName) {
+    const domains = values.length > 1 ? ['.claude.ai', 'claude.ai'] : ['.claude.ai', 'claude.ai'];
+    values.slice(0, 2).forEach((value, i) => {
+      const targets = values.length > 1 ? [domains[i]] : domains;
+      for (const domain of targets) {
+        payload.push({ name, value, domain, path: '/', httpOnly: true, secure: true, sameSite: 'Lax', expires });
+      }
+    });
+  }
+
+  await context.addCookies(payload);
+}
+
+const REAL_PROFILE_DEBUG_PORT = 9223;
+
+/**
+ * Start the locally installed Chrome on the user's real profile with a debug
+ * port and attach to it. Returns null (after cleaning up) when Chrome refuses,
+ * which is what Chrome 136+ does for the default user-data-dir.
+ */
+async function tryLaunchRealProfile({ chromePath, liveUserDataDir, profile, timeoutMs = 20000 }) {
+  console.log(`Starting your Chrome on profile "${profile.dir}" with debugging enabled...`);
+
+  const child = spawn(chromePath, [
+    `--remote-debugging-port=${REAL_PROFILE_DEBUG_PORT}`,
+    `--user-data-dir=${liveUserDataDir}`,
+    `--profile-directory=${profile.dir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    SETTINGS_URL
+  ], { detached: true, stdio: 'ignore' });
+  child.unref();
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isPortOpen(REAL_PROFILE_DEBUG_PORT)) {
+      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${REAL_PROFILE_DEBUG_PORT}`);
+      const contexts = browser.contexts();
+      const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+      const pages = context.pages();
+      let page = pages.find(p => p.url().includes('claude.ai'));
+      if (page) {
+        await page.bringToFront().catch(() => {});
+      } else {
+        page = await context.newPage();
+      }
+      return { browser, context, page };
+    }
+    await sleep(500);
+  }
+
+  // Debugging never came up: close the window we opened so nothing is left behind.
+  try {
+    if (process.platform === 'win32') {
+      execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      process.kill(-child.pid, 'SIGTERM');
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Open a browser for the bot, preferring the user's own Chrome install.
+ *
+ * Order of preference:
+ *   1. Attach over CDP to a Chrome the user already has running with a debug
+ *      port - that is literally their live browser and session.
+ *   2. Start the local chrome.exe on their real profile with a debug port and
+ *      attach to that (only works when Chrome is closed, and only on Chrome
+ *      builds that still allow debugging on the default user-data-dir).
+ *   3. Launch the locally installed chrome.exe against the bot's own profile
+ *      directory, seeded with the claude.ai sessionKey when one is provided.
+ *
+ * Note on why the live Chrome profile cannot simply be borrowed: Chrome 136+
+ * refuses remote debugging on the default user-data-dir, and Chrome's
+ * app-bound cookie encryption (v20) makes a copied profile decrypt to nothing.
+ * So either attach over CDP, or sign in once in the bot's own profile.
+ */
+async function openBrowser(options) {
+  const chromePath = chromeProfile.findChromeExecutable(options.chromePath);
+  const result = { browser: null, context: null, page: null, isCdp: false, chromePath };
+
+  const cdpPort = options.cdpPort || (await isPortOpen(9222) ? '9222' : null);
+  if (cdpPort) {
+    const cdpUrl = `http://127.0.0.1:${cdpPort}`;
+    console.log(`\nAttaching to your running Chrome over CDP (${cdpUrl})...`);
+    result.browser = await chromium.connectOverCDP(cdpUrl);
+    const contexts = result.browser.contexts();
+    result.context = contexts.length > 0 ? contexts[0] : await result.browser.newContext();
+
+    const pages = result.context.pages();
+    result.page = pages.find(p => p.url().includes('claude.ai'));
+    if (result.page) {
+      console.log(`Found an existing Claude tab: ${result.page.url()}`);
+      await result.page.bringToFront();
+    } else {
+      result.page = await result.context.newPage();
+    }
+    result.isCdp = true;
+    return result;
+  }
+
+  if (!chromePath) {
+    console.log('\nCould not find a local Chrome install; falling back to Playwright Chromium.');
+    console.log('Pass --chrome-path "C:\\Path\\To\\chrome.exe" to point at it explicitly.');
+  } else {
+    console.log(`\nUsing your local Chrome: ${chromePath}`);
+  }
+
+  // Report which local profile we are targeting, so the right account is used.
+  const liveUserDataDir = chromeProfile.defaultUserDataDir();
+  const profile = chromeProfile.resolveProfile(liveUserDataDir, options.chromeProfile);
+  if (profile) {
+    console.log(`Chrome account    : ${profile.email || profile.name} (${profile.dir})`);
+  } else if (options.chromeProfile) {
+    console.log(`Chrome account    : no local profile matched "${options.chromeProfile}"`);
+  }
+
+  // Best case: start YOUR Chrome, on YOUR profile, with a debug port, and drive
+  // that. Only possible while Chrome is not already running (its profile is
+  // single-instance locked), and only if this Chrome build still allows remote
+  // debugging on the default user-data-dir.
+  if (options.useRealProfile && chromePath && profile) {
+    if (chromeProfile.isChromeRunning()) {
+      console.log('Chrome is already running, so it cannot be switched into debug mode.');
+      console.log('Close Chrome and re-run to drive your real profile, or run "npm run chrome:debug" first.');
+    } else {
+      const attached = await tryLaunchRealProfile({ chromePath, liveUserDataDir, profile });
+      if (attached) {
+        console.log('Attached to your real Chrome profile - your existing claude.ai login is in use.');
+        return { ...result, ...attached, isCdp: true };
+      }
+      console.log('This Chrome build refuses remote debugging on the default profile directory');
+      console.log('(Chrome 136+ security change), so falling back to the bot profile.');
+    }
+  }
+
+  if (!fs.existsSync(options.userDataDir)) {
+    fs.mkdirSync(options.userDataDir, { recursive: true });
+  }
+
+  const launchOptions = {
+    headless: options.headless,
+    viewport: { width: 1280, height: 850 },
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-default-browser-check',
+      '--no-first-run'
+    ]
+  };
+
+  if (chromePath) {
+    result.context = await chromium.launchPersistentContext(options.userDataDir, {
+      ...launchOptions,
+      executablePath: chromePath
+    });
+  } else {
+    try {
+      result.context = await chromium.launchPersistentContext(options.userDataDir, {
+        ...launchOptions,
+        channel: 'chrome'
+      });
+    } catch (err) {
+      result.context = await chromium.launchPersistentContext(options.userDataDir, launchOptions);
+    }
+  }
+
+  const sessionCookies = readSessionCookies(options.sessionKey);
+  if (sessionCookies.length) {
+    console.log(`Reusing your existing claude.ai session (${sessionCookies.map(c => c.name).join(', ')}) - no new sign-in.`);
+    await applySessionCookies(result.context, sessionCookies);
+  }
+
+  result.page = result.context.pages().length > 0 ? result.context.pages()[0] : await result.context.newPage();
+  return result;
 }
 
 async function main() {
@@ -325,13 +902,42 @@ async function main() {
     return;
   }
 
+  if (options.listProfiles) {
+    const userDataDir = chromeProfile.defaultUserDataDir();
+    const { profiles, lastUsed } = chromeProfile.listProfiles(userDataDir);
+    console.log(`Chrome user data: ${userDataDir}`);
+    if (!profiles.length) {
+      console.log('No Chrome profiles found.');
+      return;
+    }
+    for (const p of profiles) {
+      const marks = [p.dir === lastUsed ? 'last used' : null,
+                     chromeProfile.isProfileLocked(userDataDir, p.dir) ? 'open in Chrome' : null]
+                    .filter(Boolean).join(', ');
+      console.log(`  ${p.dir.padEnd(12)} ${(p.name || '').padEnd(14)} ${(p.email || '').padEnd(30)} ${marks}`);
+    }
+    return;
+  }
+
   console.log('='.repeat(65));
   console.log('  Claude Active Sessions Manager - Bot Mode');
   console.log('='.repeat(65));
-  console.log(`Allowed Locations : ${options.allowedLocations.join(', ')}`);
-  console.log(`Mode              : ${options.dryRun ? 'DRY-RUN (Preview only)' : 'LIVE (Auto-terminate unauthorized)'}`);
+  console.log(`Protected (always): ${PROTECTED_LOCATIONS.join(', ')}`);
+  const extras = options.allowedLocations.filter(l => !PROTECTED_LOCATIONS.includes(l));
+  if (extras.length) console.log(`Protected (extra) : ${extras.join(', ')}`);
+  console.log(`Mode              : ${options.dryRun ? 'DRY-RUN (Preview only)' : 'LIVE (Auto-terminate unprotected)'}`);
   console.log(`Interval          : ${options.once ? 'Single scan (--once)' : `Every ${options.interval}s (Every-minute bot)`}`);
   console.log(`Session Dir       : ${options.userDataDir}`);
+
+  if (options.forgetSelf) {
+    clearSelfSession(options.userDataDir);
+    console.log("Forgot the bot's own session; it will be re-pinned on this run.");
+  } else {
+    options.selfSession = getSelfSession(options.userDataDir);
+    if (options.selfSession) {
+      console.log(`Bot's own session : ${options.selfSession.deviceText} | ${options.selfSession.locationText || 'N/A'} (never terminated)`);
+    }
+  }
   console.log('='.repeat(65));
 
   let browser = null;
@@ -360,94 +966,71 @@ async function main() {
   process.on('SIGTERM', cleanup);
 
   try {
-    // 1. Connect over CDP or Launch Persistent Context
-    const cdpPort = options.cdpPort || (await isPortOpen(9222) ? '9222' : null);
-
-    if (cdpPort) {
-      const cdpUrl = `http://127.0.0.1:${cdpPort}`;
-      console.log(`\nConnecting to existing browser over CDP (${cdpUrl})...`);
-      browser = await chromium.connectOverCDP(cdpUrl);
-      const contexts = browser.contexts();
-      context = contexts.length > 0 ? contexts[0] : await browser.newContext();
-
-      const pages = context.pages();
-      page = pages.find(p => p.url().includes('claude.ai'));
-      if (page) {
-        console.log(`Found existing Claude tab: ${page.url()}`);
-        await page.bringToFront();
-      } else {
-        page = await context.newPage();
-      }
-      isCdp = true;
-    } else {
-      if (!fs.existsSync(options.userDataDir)) {
-        fs.mkdirSync(options.userDataDir, { recursive: true });
-      }
-
-      console.log(`\nLaunching desktop browser with persistent profile...`);
-      const launchOptions = {
-        headless: options.headless,
-        viewport: { width: 1280, height: 850 },
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--no-default-browser-check'
-        ]
-      };
-
-      try {
-        context = await chromium.launchPersistentContext(options.userDataDir, {
-          ...launchOptions,
-          channel: 'chrome'
-        });
-      } catch (err) {
-        console.log('Google Chrome channel not found, launching default Chromium...');
-        context = await chromium.launchPersistentContext(options.userDataDir, launchOptions);
-      }
-
-      page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
-    }
+    // 1. Open the browser (attach to your Chrome, or launch your chrome.exe)
+    const opened = await openBrowser(options);
+    browser = opened.browser;
+    context = opened.context;
+    page = opened.page;
+    isCdp = opened.isCdp;
 
     // 2. Initial Authentication Check
-    const settingsUrl = 'https://claude.ai/new#settings/account';
+    const settingsUrl = SETTINGS_URL;
     console.log(`Navigating to ${settingsUrl}...`);
     await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
     console.log('Checking authentication status...');
     let loggedIn = false;
-    const maxWaitTime = 120000; // 2 minutes
+    let promptedForLogin = false;
+    const maxWaitTime = 300000; // 5 minutes to finish a manual sign-in
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitTime && !isShuttingDown) {
-      const currentUrl = page.url();
-      const isLoginPage = currentUrl.includes('/login');
-      const isTurnstile = (await page.title().catch(() => '')).includes('Just a moment');
-
-      if (isLoginPage || isTurnstile) {
-        console.log('\n[Action Required] Claude is prompting for login or verification.');
-        console.log('Please log in to your Claude account in the opened browser window.');
-        console.log('Waiting for login to complete (session will be saved for future runs)...\n');
-        
-        await page.waitForURL(url => !url.toString().includes('/login') && !url.toString().includes('turnstile'), {
-          timeout: maxWaitTime - (Date.now() - startTime)
-        }).catch(() => {});
-      }
-
-      const hasActiveSessions = await page.locator('text=Active sessions').isVisible().catch(() => false);
-      const hasAccount = await page.locator('text=Log out of all devices').isVisible().catch(() => false);
-      const hasSettings = await page.locator('[aria-label="Settings"], button:has-text("Settings")').isVisible().catch(() => false);
-      const hasUserMenu = await page.locator('[data-testid="user-menu-button"]').isVisible().catch(() => false);
-
-      if (hasActiveSessions || hasAccount || hasSettings || hasUserMenu) {
+      if (await isSignedIn(page)) {
         loggedIn = true;
         break;
+      }
+
+      const currentUrl = page.url();
+      const onLoginPage = currentUrl.includes('/login') || currentUrl.includes('/magic-link');
+      const onTurnstile = (await page.title().catch(() => '')).includes('Just a moment');
+
+      if ((onLoginPage || onTurnstile) && !promptedForLogin) {
+        promptedForLogin = true;
+        console.log('');
+        if (readSessionKey(options.sessionKey)) {
+          console.log('[Action required] The saved session key was not accepted - it has most');
+          console.log('likely expired, or was truncated when it was copied.');
+          console.log('Re-copy it from your everyday Chrome (F12 > Application > Cookies >');
+          console.log('https://claude.ai > sessionKey) and save it with:');
+          console.log('  npm run session-key -- <paste the value>');
+          console.log('Or just sign in in the window that opened; that also works.');
+        } else {
+          console.log('[Action required] This browser profile is not signed in to Claude.');
+          console.log('Sign in once in the window that just opened - it is remembered from then on.');
+          console.log('To avoid a sign-in entirely, copy the "sessionKey" cookie out of your');
+          console.log('everyday Chrome (F12 > Application > Cookies > https://claude.ai) and run:');
+          console.log('  npm run session-key -- <paste the value>');
+        }
+        console.log('');
+      }
+
+      if (onLoginPage) {
+        // Wait for the sign-in to land somewhere that is not the login flow.
+        await page.waitForURL(url => !url.toString().includes('/login'), {
+          timeout: Math.max(5000, maxWaitTime - (Date.now() - startTime))
+        }).catch(() => {});
+        await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       }
 
       await page.waitForTimeout(2000);
     }
 
     if (!loggedIn) {
-      throw new Error('Authentication timed out. Please log in and restart the bot.');
+      throw new Error('Not signed in to Claude (timed out waiting). Sign in once in the bot window, or provide a session key, then restart.');
     }
+
+    // Anchor "which row is mine" to the moment this bot authenticated.
+    options.botStartedAt = Date.now();
 
     console.log('Authentication confirmed! Bot is active.');
 
@@ -487,4 +1070,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, isLocationAllowed, performScan };
+module.exports = {
+  main,
+  isLocationAllowed,
+  classifySession,
+  performScan,
+  parseSessionCookies,
+  readSessionCookies,
+  PROTECTED_LOCATIONS
+};
