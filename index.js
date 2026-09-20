@@ -126,7 +126,7 @@ Options:
                             email (default: "${DEFAULT_CHROME_PROFILE}")
   --chrome-path <exe>       Path to chrome.exe (default: auto-detected local install)
   --session-key <value>     Reuse your existing claude.ai session cookie instead of
-                            logging in again (also read from session-key.txt)
+                            signing in again (also read from .env / session-key.txt)
   --separate-profile        Skip the real Chrome profile; use ./chrome_session only
   --cdp [port]              Attach to a Chrome already running with remote debugging (e.g. 9222)
   --user-data-dir <dir>     Directory to persist browser login data (default: ./chrome_session)
@@ -141,8 +141,11 @@ Examples:
   # 2. Start the bot in Dry-Run mode (Monitor only, no terminations):
   node index.js --dry-run
 
-  # 3. Check every 30 seconds:
-  node index.js --interval 30
+  # 3. Choose a scan interval (seconds):
+  node index.js --interval 60     # every 1 minute   (npm run bot:1m)
+  node index.js --interval 300    # every 5 minutes  (npm run bot:5m)
+  node index.js --interval 600    # every 10 minutes (npm run bot:10m)
+  node index.js --interval 900    # every 15 minutes (npm run bot:15m)
 
   # 4. Single-run scan and exit:
   node index.js --once
