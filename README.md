@@ -24,12 +24,15 @@ Four further safety rules make a wrong termination very hard:
 3. **Runaway guard.** If *every* row looks unprotected - which on a healthy
    account is impossible, since the current session is always protected - the
    bot assumes it misread the page and terminates nothing that round.
-4. **The bot never logs itself out.** Its own browser appears in the list as an
-   ordinary device, from wherever *this machine's* connection geolocates - which
-   is usually not one of the protected cities. On first run the bot identifies
-   that row (same platform, created when it signed in), pins it in
-   `bot-session.json`, and never terminates it. Other sessions from that same
-   city are still terminated normally. Re-pin with `--forget-self`.
+4. **"Log out" can never be clicked.** The account page carries a plain
+   `Log out` button (and on some accounts `Log out of all devices`), which would
+   end sessions this bot exists to protect. Two independent layers stop it: a
+   capture-phase listener injected into the page swallows any click on a logout
+   control before the app sees it, and every click the bot makes is checked
+   against the element's own label first. Terminating one session goes through
+   the row menu and its `Terminate session` confirmation, which never say
+   "log out". The bot's own session is the one Claude marks **Current**, so it
+   is protected by rule 0 and cannot log itself out either.
 
 ---
 
@@ -144,7 +147,6 @@ Options:
   --cdp [port]              Attach to a Chrome already running with a debug port
   --user-data-dir <dir>     Directory to persist browser login data (default: ./chrome_session)
   --headless                Run in headless mode (after the first sign-in)
-  --forget-self             Forget which session is the bot's own and re-pin it
   --list-profiles           List local Chrome profiles and exit
   -h, --help                Show help message
 ```

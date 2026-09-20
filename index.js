@@ -45,8 +45,6 @@ function parseArgs() {
     useRealProfile: true,                    // Drive the real Chrome profile when possible
     sessionKey: null,                        // claude.ai sessionKey cookie to reuse
     listProfiles: false,                     // Print local Chrome profiles and exit
-    forgetSelf: false,                       // Re-pin which session belongs to the bot
-    selfSession: null,                       // The bot's own session row (never terminated)
     botStartedAt: Date.now()
   };
 
@@ -97,8 +95,6 @@ function parseArgs() {
       options.userDataDir = path.resolve(arg.split('=')[1]);
     } else if (arg === '--headless') {
       options.headless = true;
-    } else if (arg === '--forget-self') {
-      options.forgetSelf = true;
     } else if (arg === '--list-profiles') {
       options.listProfiles = true;
     } else if (arg === '--help' || arg === '-h') {
@@ -135,7 +131,6 @@ Options:
   --cdp [port]              Attach to a Chrome already running with remote debugging (e.g. 9222)
   --user-data-dir <dir>     Directory to persist browser login data (default: ./chrome_session)
   --headless                Run in headless mode (recommended after initial login is saved)
-  --forget-self             Forget which session is the bot's own and re-pin it
   --list-profiles           List the local Chrome profiles and exit
   -h, --help                Show this help message
 
@@ -204,91 +199,14 @@ function isLocationAllowed(location, allowedLocations) {
 }
 
 /**
- * The bot's own browser shows up in the session list as an ordinary device,
- * from wherever this machine's connection geolocates - which is usually NOT one
- * of the protected locations. Without pinning it, the bot would terminate its
- * own session, get logged out, sign in again, and repeat forever.
- *
- * So the row the bot created is recorded on first run and protected from then
- * on. State is keyed by profile directory and lives in bot-session.json.
- */
-const SELF_STATE_FILE = path.join(__dirname, 'bot-session.json');
-
-function loadSelfState() {
-  try {
-    return JSON.parse(fs.readFileSync(SELF_STATE_FILE, 'utf8'));
-  } catch (e) {
-    return {};
-  }
-}
-
-function getSelfSession(userDataDir) {
-  const state = loadSelfState();
-  return state[userDataDir] || null;
-}
-
-function setSelfSession(userDataDir, row) {
-  const state = loadSelfState();
-  state[userDataDir] = row;
-  try {
-    fs.writeFileSync(SELF_STATE_FILE, JSON.stringify(state, null, 2) + '\n', 'utf8');
-  } catch (e) {}
-}
-
-function clearSelfSession(userDataDir) {
-  const state = loadSelfState();
-  delete state[userDataDir];
-  try {
-    fs.writeFileSync(SELF_STATE_FILE, JSON.stringify(state, null, 2) + '\n', 'utf8');
-  } catch (e) {}
-}
-
-function isSelfSession(row, self) {
-  if (!self) return false;
-  return row.deviceText === self.deviceText &&
-         row.locationText === self.locationText &&
-         row.createdText === self.createdText;
-}
-
-// The device string Claude shows for a browser running on this OS.
-function ownPlatformToken() {
-  if (process.platform === 'win32') return 'windows';
-  if (process.platform === 'darwin') return 'mac';
-  return 'linux';
-}
-
-/**
- * Pick the row that is this bot's own session: same platform as this machine,
- * and created around the time the bot signed in.
- */
-function findOwnRow(rows, botStartedAt, windowMs = 15 * 60 * 1000) {
-  let best = null;
-  let bestDelta = Infinity;
-
-  for (const row of rows) {
-    if (!row.deviceText.toLowerCase().includes(ownPlatformToken())) continue;
-    const created = Date.parse(row.createdText);
-    if (Number.isNaN(created)) continue;
-    const delta = Math.abs(created - botStartedAt);
-    if (delta <= windowMs && delta < bestDelta) {
-      best = row;
-      bestDelta = delta;
-    }
-  }
-  return best;
-}
-
-/**
  * Decide what to do with one session row - deliberately biased towards keeping.
  * Returns { keep: boolean, reason: string }.
  */
-function classifySession({ deviceText, locationText, createdText, isCurrent }, allowedLocations, self) {
+function classifySession({ deviceText, locationText, isCurrent }, allowedLocations) {
+  // The bot's own session is always the one Claude marks "Current": that flag is
+  // rendered for whichever session requested the page, which is this browser.
   if (isCurrent) {
     return { keep: true, reason: 'Current session' };
-  }
-
-  if (isSelfSession({ deviceText, locationText, createdText }, self)) {
-    return { keep: true, reason: "This bot's own session" };
   }
 
   const location = (locationText || '').replace(/\s+/g, ' ').trim();
@@ -335,6 +253,100 @@ async function firstVisible(page, candidates, timeoutMs = 5000) {
     await page.waitForTimeout(200);
   }
   return null;
+}
+
+// Any logout control is off-limits to the bot. The settings page carries a
+// plain "Log out" button (and, on some accounts, "Log out of all devices");
+// clicking either would end sessions this bot is meant to protect. Terminating
+// a single session is done through the row menu, which never says "log out".
+const FORBIDDEN_CLICK_TEXT = /log\s*out|sign\s*out/i;
+
+/**
+ * Install a capture-phase guard in the page that swallows any click on a
+ * "Log out of all devices" control before it can reach the app.
+ *
+ * This is the hard stop: even a stray or mis-aimed click cannot trigger it.
+ * It applies to this automated browser window only.
+ */
+async function installLogoutGuard(page) {
+  const guard = () => {
+    if (window.__claudeBotLogoutGuard) return;
+    window.__claudeBotLogoutGuard = true;
+    const FORBIDDEN = /log\s*out|sign\s*out/i;
+    const block = event => {
+      const el = event.target && event.target.closest
+        ? event.target.closest('button, a, [role="menuitem"], [role="button"]')
+        : null;
+      if (!el) return;
+      const label = (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+      if (FORBIDDEN.test(label)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        console.warn('[claude-bot] Blocked a click on:', label.trim());
+      }
+    };
+    for (const type of ['pointerdown', 'mousedown', 'click']) {
+      document.addEventListener(type, block, true);
+    }
+  };
+
+  // addInitScript covers every future navigation; evaluate covers the page
+  // that is already open.
+  await page.addInitScript(guard).catch(() => {});
+  await page.evaluate(guard).catch(() => {});
+}
+
+// Click only after checking the element is not a "log out of all devices" control.
+async function safeClick(locator, what = 'element') {
+  const label = ((await locator.innerText().catch(() => '')) + ' ' +
+                 (await locator.getAttribute('aria-label').catch(() => '') || '')).trim();
+  if (FORBIDDEN_CLICK_TEXT.test(label)) {
+    throw new Error(`Refused to click ${what}: its label ("${label}") would log out all devices.`);
+  }
+  await locator.click();
+}
+
+/**
+ * Confirm Claude's "Terminate session" dialog.
+ *
+ * Deliberately strict: it clicks a button only when that button's own label is
+ * exactly "Terminate". The settings page also carries a "Log out of all
+ * devices" button, and a loose text match there would sign out every session,
+ * protected ones included - so no such fallback exists here.
+ */
+async function confirmTermination(page, timeoutMs = 8000) {
+  // Target the confirmation modal specifically: it is an alertdialog headed
+  // "Terminate session". The settings panel itself is also role="dialog", so an
+  // unfiltered lookup would land on the wrong element.
+  const dialog = await firstVisible(page, [
+    page.locator('[role="alertdialog"]').filter({ hasText: /terminate session/i }),
+    page.getByRole('alertdialog'),
+    page.locator('[role="dialog"]').filter({ hasText: /terminate session/i })
+  ], timeoutMs);
+
+  if (!dialog) return false;
+
+  const button = await firstVisible(page, [
+    dialog.getByRole('button', { name: /^\s*terminate\s*$/i }),
+    dialog.locator('button').filter({ hasText: /^\s*terminate\s*$/i })
+  ], 4000);
+
+  if (!button) return false;
+
+  const label = (await button.innerText().catch(() => '')).trim();
+  if (!/^terminate$/i.test(label)) {
+    console.warn(`  --> Refusing to click confirm button labelled "${label}".`);
+    return false;
+  }
+
+  await safeClick(button, 'the confirm button');
+  return true;
+}
+
+// Close a dialog that was opened but must not be acted on.
+async function dismissDialog(page) {
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(300);
 }
 
 // Read every session row's text in one pass (device, location, created).
@@ -385,6 +397,9 @@ async function performScan(page, options, checkNumber) {
     console.warn(`[${time}] Navigation warning: ${e.message}`);
   }
 
+  // Re-arm the guard after every navigation/reload.
+  await installLogoutGuard(page);
+
   // Ensure "Active sessions" is visible
   let activeSessionsHeader = page.locator('text=Active sessions');
   if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
@@ -407,23 +422,6 @@ async function performScan(page, options, checkNumber) {
     });
     await page.waitForTimeout(1000);
   } catch (e) {}
-
-  // On the first pass, work out which row is this bot's own browser and pin it,
-  // so the bot can never terminate the session it is itself using.
-  if (!options.selfSession) {
-    const snapshot = await readAllRows(page);
-    const own = findOwnRow(snapshot, options.botStartedAt || Date.now());
-    if (own) {
-      options.selfSession = {
-        deviceText: own.deviceText,
-        locationText: own.locationText,
-        createdText: own.createdText
-      };
-      setSelfSession(options.userDataDir, options.selfSession);
-      console.log(`  [SELF]  Pinned this bot's own session: ${own.deviceText} | ${own.locationText || 'N/A'} | ${own.createdText}`);
-      console.log('          It will never be terminated. Re-pin with --forget-self.');
-    }
-  }
 
   let terminatedCount = 0;
   let keptCount = 0;
@@ -457,7 +455,7 @@ async function performScan(page, options, checkNumber) {
                         (await row.locator('button[aria-label*="current session"]').count()) > 0;
 
       const sessionKey = `${deviceText}_${locationText}_${createdText}`;
-      const verdict = classifySession({ deviceText, locationText, createdText, isCurrent }, options.allowedLocations, options.selfSession);
+      const verdict = classifySession({ deviceText, locationText, isCurrent }, options.allowedLocations);
 
       readableRows++;
       if (verdict.keep) keepableRows++;
@@ -506,7 +504,7 @@ async function performScan(page, options, checkNumber) {
           continueScanning = true;
           continue;
         }
-        const recheckVerdict = classifySession({ ...recheck, createdText }, options.allowedLocations, options.selfSession);
+        const recheckVerdict = classifySession(recheck, options.allowedLocations);
         if (recheckVerdict.keep || recheck.locationText !== locationText || recheck.deviceText !== deviceText) {
           console.warn(`  [SKIP] Row changed on re-check (now "${recheck.deviceText}" @ "${recheck.locationText}" - ${recheckVerdict.reason}). Not terminating.`);
           processedKeys.add(sessionKey);
@@ -520,7 +518,7 @@ async function performScan(page, options, checkNumber) {
         try {
           const actionBtn = rowToTerminate.locator('button[aria-haspopup="menu"], button[aria-label*="Session actions"], button').first();
           await actionBtn.scrollIntoViewIfNeeded();
-          await actionBtn.click();
+          await safeClick(actionBtn, 'the row action button');
           await page.waitForTimeout(500);
 
           // Playwright rejects a selector list that mixes CSS with a `text=`
@@ -536,20 +534,29 @@ async function performScan(page, options, checkNumber) {
           if (!terminateItem) {
             throw new Error('No "Terminate" menu item appeared.');
           }
-          await terminateItem.click();
+          await safeClick(terminateItem, 'the Terminate menu item');
           await page.waitForTimeout(500);
 
-          // Handle optional confirmation dialog
-          try {
-            const confirmBtn = page.locator('[role="dialog"] button:has-text("Terminate"), [role="alertdialog"] button:has-text("Terminate"), div[data-cds="Dialog"] button:has-text("Terminate"), button:has-text("Log out")').first();
-            if (await confirmBtn.isVisible({ timeout: 2000 })) {
-              await confirmBtn.click();
-            }
-          } catch (e) {}
+          // Claude asks "Terminate session - are you sure?" before acting.
+          const confirmed = await confirmTermination(page);
+          if (!confirmed) {
+            console.warn('  --> Could not confirm in the dialog; nothing was terminated.');
+            await dismissDialog(page);
+            continueScanning = true;
+            continue;
+          }
 
-          console.log(`  --> Successfully terminated session!`);
-          terminatedCount++;
+          // Only count it once the row is actually gone from the table.
           await page.waitForTimeout(1500);
+          const stillThere = (await readAllRows(page)).some(r =>
+            r.deviceText === deviceText && r.locationText === locationText && r.createdText === createdText);
+
+          if (stillThere) {
+            console.warn('  --> Session still listed after confirming; will retry next round.');
+          } else {
+            console.log('  --> Successfully terminated session!');
+            terminatedCount++;
+          }
 
           // Re-evaluate table on next iteration
           continueScanning = true;
@@ -576,7 +583,7 @@ async function performScan(page, options, checkNumber) {
       if (processedKeys.has(sessionKey)) continue;
 
       const isCurrent = deviceText.toLowerCase().includes('current') || (await row.locator('text=Current').count()) > 0;
-      const verdict = classifySession({ deviceText, locationText, createdText, isCurrent }, options.allowedLocations, options.selfSession);
+      const verdict = classifySession({ deviceText, locationText, isCurrent }, options.allowedLocations);
 
       if (verdict.keep) {
         console.log(`  [KEEP]  ${deviceText.replace(/\n/g, ' ')} | Location: ${locationText || 'N/A'} | ${verdict.reason}`);
@@ -929,15 +936,6 @@ async function main() {
   console.log(`Interval          : ${options.once ? 'Single scan (--once)' : `Every ${options.interval}s (Every-minute bot)`}`);
   console.log(`Session Dir       : ${options.userDataDir}`);
 
-  if (options.forgetSelf) {
-    clearSelfSession(options.userDataDir);
-    console.log("Forgot the bot's own session; it will be re-pinned on this run.");
-  } else {
-    options.selfSession = getSelfSession(options.userDataDir);
-    if (options.selfSession) {
-      console.log(`Bot's own session : ${options.selfSession.deviceText} | ${options.selfSession.locationText || 'N/A'} (never terminated)`);
-    }
-  }
   console.log('='.repeat(65));
 
   let browser = null;
@@ -1029,8 +1027,10 @@ async function main() {
       throw new Error('Not signed in to Claude (timed out waiting). Sign in once in the bot window, or provide a session key, then restart.');
     }
 
-    // Anchor "which row is mine" to the moment this bot authenticated.
+    // Anchor timing and make "Log out of all devices" unclickable in this window.
     options.botStartedAt = Date.now();
+    await installLogoutGuard(page);
+    console.log('Safety guard armed: every "Log out" control is blocked in this window.');
 
     console.log('Authentication confirmed! Bot is active.');
 
@@ -1077,5 +1077,8 @@ module.exports = {
   performScan,
   parseSessionCookies,
   readSessionCookies,
+  installLogoutGuard,
+  safeClick,
+  confirmTermination,
   PROTECTED_LOCATIONS
 };

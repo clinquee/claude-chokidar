@@ -7,4 +7,3 @@ session-key.txt
 chrome_profile/
 .env
 .env.local
-bot-session.json

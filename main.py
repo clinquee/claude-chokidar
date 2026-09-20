@@ -43,17 +43,15 @@ def is_location_allowed(location: str, allowed_locations: List[str]) -> bool:
 
 
 def classify_session(device_text: str, location_text: str, is_current: bool,
-                     allowed_locations: List[str], self_session=None,
-                     created_text: str = "") -> Tuple[bool, str]:
+                     allowed_locations: List[str]) -> Tuple[bool, str]:
     """Decide what to do with one session row, biased towards keeping it.
 
     Returns (keep, reason).
     """
+    # The bot's own session is always the one Claude marks "Current": that flag
+    # is rendered for whichever session requested the page, i.e. this browser.
     if is_current:
         return True, "Current session"
-
-    if is_self_session(device_text, location_text, created_text, self_session):
-        return True, "This bot's own session"
 
     location = " ".join((location_text or "").split())
 
@@ -285,91 +283,103 @@ def get_timestamp() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
 
-# The bot's own browser shows up in the session list as an ordinary device, from
-# wherever this machine's connection geolocates - usually NOT a protected
-# location. Without pinning it, the bot would terminate its own session, get
-# logged out, sign in again, and repeat forever. So the row the bot created is
-# recorded on first run and protected from then on.
-SELF_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot-session.json")
+# Any logout control is off-limits to the bot. The settings page carries a plain
+# "Log out" button (and, on some accounts, "Log out of all devices"); clicking
+# either would end sessions this bot is meant to protect. Terminating a single
+# session goes through the row menu, which never says "log out".
+FORBIDDEN_CLICK_TEXT = re.compile(r"log\s*out|sign\s*out", re.I)
+
+LOGOUT_GUARD_JS = r"""
+() => {
+  if (window.__claudeBotLogoutGuard) return;
+  window.__claudeBotLogoutGuard = true;
+  const FORBIDDEN = /log\s*out|sign\s*out/i;
+  const block = event => {
+    const el = event.target && event.target.closest
+      ? event.target.closest('button, a, [role="menuitem"], [role="button"]')
+      : null;
+    if (!el) return;
+    const label = (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+    if (FORBIDDEN.test(label)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      console.warn('[claude-bot] Blocked a click on:', label.trim());
+    }
+  };
+  for (const type of ['pointerdown', 'mousedown', 'click']) {
+    document.addEventListener(type, block, true);
+  }
+}
+"""
 
 
-def load_self_state():
+async def install_logout_guard(page):
+    """Swallow any click on a "Log out of all devices" control before it reaches
+    the app. This is the hard stop: even a stray click cannot trigger it.
+    Applies to this automated browser window only."""
     try:
-        with open(SELF_STATE_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+        await page.add_init_script(LOGOUT_GUARD_JS)
     except Exception:
-        return {}
-
-
-def get_self_session(user_data_dir):
-    return load_self_state().get(user_data_dir)
-
-
-def set_self_session(user_data_dir, row):
-    state = load_self_state()
-    state[user_data_dir] = row
+        pass
     try:
-        with open(SELF_STATE_FILE, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-            fh.write("\n")
+        await page.evaluate(LOGOUT_GUARD_JS)
     except Exception:
         pass
 
 
-def clear_self_session(user_data_dir):
-    state = load_self_state()
-    state.pop(user_data_dir, None)
+async def safe_click(locator, what="element"):
+    """Click only after checking this is not a "log out of all devices" control."""
     try:
-        with open(SELF_STATE_FILE, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-            fh.write("\n")
+        label = (await locator.inner_text()).strip()
     except Exception:
-        pass
+        label = ""
+    try:
+        aria = await locator.get_attribute("aria-label") or ""
+    except Exception:
+        aria = ""
+    if FORBIDDEN_CLICK_TEXT.search(f"{label} {aria}"):
+        raise RuntimeError(
+            f'Refused to click {what}: its label ("{label}") would log out all devices.')
+    await locator.click()
 
 
-def is_self_session(device_text, location_text, created_text, self_session):
-    if not self_session:
+async def confirm_termination(page, timeout_seconds=8.0):
+    """Confirm Claude's "Terminate session" dialog.
+
+    Deliberately strict: a button is clicked only when its own label is exactly
+    "Terminate". The settings page also carries a "Log out of all devices"
+    button, and a loose text match there would sign out every session, protected
+    ones included - so no such fallback exists here.
+    """
+    # Target the confirmation modal specifically: it is an alertdialog headed
+    # "Terminate session". The settings panel itself is also role="dialog", so
+    # an unfiltered lookup would land on the wrong element.
+    dialog = await first_visible(page, [
+        page.locator('[role="alertdialog"]').filter(
+            has_text=re.compile("terminate session", re.I)),
+        page.get_by_role("alertdialog"),
+        page.locator('[role="dialog"]').filter(
+            has_text=re.compile("terminate session", re.I)),
+    ], timeout_seconds)
+
+    if dialog is None:
         return False
-    return (device_text == self_session.get("deviceText")
-            and location_text == self_session.get("locationText")
-            and created_text == self_session.get("createdText"))
 
+    button = await first_visible(page, [
+        dialog.get_by_role("button", name=re.compile(r"^\s*terminate\s*$", re.I)),
+        dialog.locator("button").filter(has_text=re.compile(r"^\s*terminate\s*$", re.I)),
+    ], 4.0)
 
-def own_platform_token():
-    """The device string Claude shows for a browser running on this OS."""
-    if sys.platform == "win32":
-        return "windows"
-    if sys.platform == "darwin":
-        return "mac"
-    return "linux"
+    if button is None:
+        return False
 
+    label = (await button.inner_text()).strip()
+    if not re.fullmatch(r"terminate", label, re.I):
+        print(f'  --> Refusing to click confirm button labelled "{label}".')
+        return False
 
-def parse_created(created_text):
-    """Parse Claude's 'Sep 20, 2026, 4:59 PM' timestamps; None when unreadable."""
-    cleaned = " ".join((created_text or "").split())
-    for fmt in ("%b %d, %Y, %I:%M %p", "%b %d, %Y %I:%M %p", "%B %d, %Y, %I:%M %p"):
-        try:
-            return datetime.datetime.strptime(cleaned, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def find_own_row(rows, bot_started_at, window_seconds=15 * 60):
-    """Pick the row that is this bot's own session: same platform as this
-    machine, created around the time the bot signed in."""
-    best = None
-    best_delta = None
-    for row in rows:
-        if own_platform_token() not in row["deviceText"].lower():
-            continue
-        created = parse_created(row["createdText"])
-        if created is None:
-            continue
-        delta = abs((created - bot_started_at).total_seconds())
-        if delta <= window_seconds and (best_delta is None or delta < best_delta):
-            best, best_delta = row, delta
-    return best
+    await safe_click(button, "the confirm button")
+    return True
 
 
 async def read_all_rows(page):
@@ -420,8 +430,7 @@ async def reread_row(row):
     return dev_text, loc_text, is_current
 
 
-async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_num: int,
-                       self_session=None, user_data_dir: str = "", bot_started_at=None):
+async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_num: int):
     settings_url = SETTINGS_URL
     time_str = get_timestamp()
     print(f"\n[{time_str}] Check #{check_num}: Inspecting active sessions...")
@@ -435,6 +444,9 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
     except Exception as e:
         print(f"[{time_str}] Navigation warning: {e}")
 
+    # Re-arm the guard after every navigation/reload.
+    await install_logout_guard(page)
+
     if not await page.locator("text=Active sessions").is_visible():
         await page.goto(settings_url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2)
@@ -443,7 +455,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
         await page.wait_for_selector("text=Active sessions", timeout=15000)
     except Exception:
         print(f"[{time_str}] Could not find 'Active sessions'. Will retry next interval.")
-        return self_session
+        return
 
     try:
         await page.evaluate("""() => {
@@ -452,22 +464,6 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
         await asyncio.sleep(1.0)
     except Exception:
         pass
-
-    # On the first pass, work out which row is this bot's own browser and pin it,
-    # so the bot can never terminate the session it is itself using.
-    if not self_session:
-        snapshot = await read_all_rows(page)
-        own = find_own_row(snapshot, bot_started_at or datetime.datetime.now())
-        if own:
-            self_session = {
-                "deviceText": own["deviceText"],
-                "locationText": own["locationText"],
-                "createdText": own["createdText"],
-            }
-            set_self_session(user_data_dir, self_session)
-            print(f"  [SELF]  Pinned this bot's own session: {own['deviceText']} | "
-                  f"{own['locationText'] or 'N/A'} | {own['createdText']}")
-            print("          It will never be terminated. Re-pin with --forget-self.")
 
     terminated_count = 0
     kept_count = 0
@@ -501,8 +497,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                           await row.locator('button[aria-label*="current session"]').count() > 0)
 
             s_key = f"{dev_text}_{loc_text}_{created_text}"
-            keep, reason = classify_session(dev_text, loc_text, is_current, allowed_locations,
-                                            self_session, created_text)
+            keep, reason = classify_session(dev_text, loc_text, is_current, allowed_locations)
 
             readable_rows += 1
             if keep:
@@ -552,8 +547,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                     continue_scanning = True
                     continue
                 re_dev, re_loc, re_current = recheck
-                re_keep, re_reason = classify_session(re_dev, re_loc, re_current, allowed_locations,
-                                                      self_session, created)
+                re_keep, re_reason = classify_session(re_dev, re_loc, re_current, allowed_locations)
                 if re_keep or re_loc != loc or re_dev != dev:
                     print(f'  [SKIP] Row changed on re-check (now "{re_dev}" @ "{re_loc}" - '
                           f'{re_reason}). Not terminating.')
@@ -568,7 +562,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                         'button[aria-haspopup="menu"], button[aria-label*="Session actions"], button'
                     ).first
                     await action_btn.scroll_into_view_if_needed()
-                    await action_btn.click()
+                    await safe_click(action_btn, "the row action button")
                     await asyncio.sleep(0.5)
 
                     # Playwright rejects a selector list that mixes CSS with a
@@ -583,21 +577,31 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                     ])
                     if terminate_item is None:
                         raise RuntimeError('No "Terminate" menu item appeared.')
-                    await terminate_item.click()
+                    await safe_click(terminate_item, "the Terminate menu item")
                     await asyncio.sleep(0.5)
 
-                    try:
-                        confirm_btn = page.locator(
-                            '[role="dialog"] button:has-text("Terminate"), [role="alertdialog"] button:has-text("Terminate"), button:has-text("Log out")'
-                        ).first
-                        if await confirm_btn.is_visible(timeout=2000):
-                            await confirm_btn.click()
-                    except Exception:
-                        pass
+                    # Claude asks "Terminate session - are you sure?" first.
+                    confirmed = await confirm_termination(page)
+                    if not confirmed:
+                        print("  --> Could not confirm in the dialog; nothing was terminated.")
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.3)
+                        continue_scanning = True
+                        continue
 
-                    print(f"  --> Successfully terminated session!")
-                    terminated_count += 1
+                    # Only count it once the row is actually gone from the table.
                     await asyncio.sleep(1.5)
+                    still_there = any(
+                        r["deviceText"] == dev and r["locationText"] == loc
+                        and r["createdText"] == created
+                        for r in await read_all_rows(page)
+                    )
+                    if still_there:
+                        print("  --> Session still listed after confirming; will retry next round.")
+                    else:
+                        print("  --> Successfully terminated session!")
+                        terminated_count += 1
+
                     continue_scanning = True
                 except Exception as term_err:
                     print(f"  --> Error terminating session: {term_err}")
@@ -618,7 +622,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                 continue
 
             is_curr = "current" in dev.lower() or await row.locator("text=Current").count() > 0
-            keep, reason = classify_session(dev, loc, is_curr, allowed_locations, self_session, created)
+            keep, reason = classify_session(dev, loc, is_curr, allowed_locations)
             if keep:
                 print(f"  [KEEP]  {dev.replace(chr(10), ' ')} | Location: {loc or 'N/A'} | {reason}")
                 kept_count += 1
@@ -630,7 +634,6 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
     total = len(processed_keys)
     action_label = "Flagged" if dry_run else "Terminated"
     print(f"[{time_str}] Check complete. Total: {total} | Kept: {kept_count} | {action_label}: {terminated_count}")
-    return self_session
 
 
 async def main():
@@ -653,8 +656,6 @@ async def main():
     parser.add_argument("--user-data-dir", type=str, default="./chrome_session",
                         help="Persistent browser profile directory (default: ./chrome_session)")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
-    parser.add_argument("--forget-self", action="store_true",
-                        help="Forget which session is the bot's own and re-pin it")
 
     args = parser.parse_args()
     extra_locations = [loc.strip().lower() for loc in args.allow.split(",") if loc.strip()]
@@ -671,15 +672,6 @@ async def main():
     print(f"Interval          : {'Single scan (--once)' if args.once else f'Every {args.interval}s (Every-minute bot)'}")
     print(f"Session Dir       : {user_data_dir}")
 
-    if args.forget_self:
-        clear_self_session(user_data_dir)
-        self_session = None
-        print("Forgot the bot's own session; it will be re-pinned on this run.")
-    else:
-        self_session = get_self_session(user_data_dir)
-        if self_session:
-            print(f"Bot's own session : {self_session['deviceText']} | "
-                  f"{self_session['locationText'] or 'N/A'} (never terminated)")
     print("=" * 65)
 
     try:
@@ -842,18 +834,13 @@ async def main():
 
         print("Authentication confirmed! Bot is active.")
 
-        # Anchor "which row is mine" to the moment this bot authenticated.
-        bot_started_at = datetime.datetime.now()
+        await install_logout_guard(page)
+        print('Safety guard armed: every "Log out" control is blocked in this window.')
 
         check_num = 1
         try:
             while True:
-                self_session = await perform_scan(
-                    page, allowed_locations, args.dry_run, check_num,
-                    self_session=self_session,
-                    user_data_dir=user_data_dir,
-                    bot_started_at=bot_started_at,
-                )
+                await perform_scan(page, allowed_locations, args.dry_run, check_num)
                 check_num += 1
 
                 if args.once:
