@@ -878,6 +878,18 @@ async function openBrowser(options) {
     ]
   };
 
+  // Headless Chrome otherwise advertises itself as "HeadlessChrome" in the
+  // user-agent, which claude.ai's Cloudflare layer answers with a "Just a
+  // moment" challenge - so the cookie never reaches a signed-in page and the
+  // bot wrongly reports it as expired. Present the same UA a normal window
+  // would, so a headless run authenticates exactly like a windowed one.
+  if (options.headless) {
+    launchOptions.userAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+    launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
+  }
+
   if (chromePath) {
     result.context = await chromium.launchPersistentContext(options.userDataDir, {
       ...launchOptions,
@@ -947,11 +959,17 @@ async function main() {
   let isCdp = false;
   let isShuttingDown = false;
 
+  // Running totals across every scan this session, printed as one line on exit.
+  const stats = { scans: 0, terminated: 0, kept: 0, startedAt: Date.now() };
+
   // Graceful shutdown handler
   async function cleanup() {
     if (isShuttingDown) return;
     isShuttingDown = true;
     console.log('\n\nStopping bot and cleaning up browser session...');
+    const mins = Math.round((Date.now() - stats.startedAt) / 60000);
+    const verb = options.dryRun ? 'Flagged' : 'Terminated';
+    console.log(`Session stats: ${stats.scans} scans | ${verb}: ${stats.terminated} | Kept: ${stats.kept} | Uptime: ${mins}m`);
     try {
       if (context && !isCdp) {
         await context.close().catch(() => {});
@@ -1041,7 +1059,10 @@ async function main() {
     let checkCount = 1;
     while (!isShuttingDown) {
       try {
-        await performScan(page, options, checkCount++);
+        const result = await performScan(page, options, checkCount++);
+        stats.scans++;
+        stats.terminated += result.terminated;
+        stats.kept += result.kept;
       } catch (scanErr) {
         console.error(`[${getTimestamp()}] Scan error: ${scanErr.message}. Will retry on next interval.`);
       }
