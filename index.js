@@ -352,32 +352,100 @@ async function dismissDialog(page) {
   await page.waitForTimeout(300);
 }
 
+// Only the table under the "Active sessions" heading may ever be touched. The
+// account page also renders a "Trusted devices" table (Device | Added) directly
+// above it, whose "Added" date would otherwise be read as a location and the row
+// treated as an unprotected session.
+const SESSIONS_TABLE = 'table[data-chokidar-sessions="1"]';
+
+/**
+ * Find the Active sessions table, tag it so locators can be scoped to it, and
+ * report which column holds what. Returns null when it cannot be identified,
+ * in which case the caller must do nothing this round.
+ */
+async function locateSessionsTable(page) {
+  return page.evaluate(() => {
+    const txt = el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+
+    document.querySelectorAll('[data-chokidar-sessions]')
+      .forEach(el => el.removeAttribute('data-chokidar-sessions'));
+
+    const heading = [...document.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+      .find(el => /^active sessions$/i.test(txt(el)));
+    if (!heading) return null;
+
+    // Prefer the table inside the heading's own section; fall back to the first
+    // table that follows the heading in document order.
+    const section = heading.closest('section') || heading.parentElement;
+    let table = section ? section.querySelector('table') : null;
+    if (!table) {
+      table = [...document.querySelectorAll('table')].find(t =>
+        heading.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING) || null;
+    }
+    if (!table) return null;
+
+    const headRow = table.querySelector('thead tr') || table.querySelector('tr');
+    if (!headRow) return null;
+    const headers = [...headRow.querySelectorAll('th, td')].map(txt);
+
+    const indexOf = name => headers.findIndex(h => new RegExp('^' + name + '$', 'i').test(h));
+    const columns = {
+      device: indexOf('device'),
+      location: indexOf('location'),
+      created: indexOf('created')
+    };
+
+    table.setAttribute('data-chokidar-sessions', '1');
+    return { headers, columns, hasThead: !!table.querySelector('thead') };
+  });
+}
+
+// Rows of the Active sessions table only (never the header row).
+function sessionRowLocator(page, table) {
+  return table && table.hasThead
+    ? page.locator(`${SESSIONS_TABLE} tbody tr`)
+    : page.locator(`${SESSIONS_TABLE} tr:not(:first-child)`);
+}
+
+// Read one row using the column positions reported by locateSessionsTable.
+async function readRow(row, columns) {
+  // A header row has no <td> cells; parsing one would read "Location" as a
+  // location and mark the header as an unprotected session.
+  if ((await row.locator('td').count()) === 0) return null;
+
+  const cells = await row.locator('th, td').all();
+  const cellText = async i => (i >= 0 && i < cells.length)
+    ? (await cells[i].innerText().catch(() => '')).trim()
+    : '';
+
+  const deviceText = await cellText(columns.device);
+  const locationText = await cellText(columns.location);
+  const createdText = await cellText(columns.created);
+  if (!deviceText && !locationText) return null;
+
+  const isCurrent = deviceText.toLowerCase().includes('current') ||
+                    (await row.locator('text=Current').count()) > 0 ||
+                    (await row.locator('button[aria-label*="current session"]').count()) > 0;
+
+  return { deviceText, locationText, createdText, isCurrent };
+}
+
 // Read every session row's text in one pass (device, location, created).
-async function readAllRows(page) {
-  const rows = await page.locator('table tr').all();
+async function readAllRows(page, table) {
+  const located = table || await locateSessionsTable(page);
+  if (!located) return [];
+  const rows = await sessionRowLocator(page, located).all();
   const out = [];
-  for (let i = 1; i < rows.length; i++) {
-    const cells = await rows[i].locator('th, td').all();
-    if (cells.length < 2) continue;
-    out.push({
-      deviceText: (await cells[0].innerText().catch(() => '')).trim(),
-      locationText: (await cells[1].innerText().catch(() => '')).trim(),
-      createdText: cells.length >= 3 ? (await cells[2].innerText().catch(() => '')).trim() : ''
-    });
+  for (const row of rows) {
+    const data = await readRow(row, located.columns);
+    if (data) out.push(data);
   }
   return out;
 }
 
 // Re-read a row's cells straight from the live DOM (used right before acting).
-async function rereadRow(row) {
-  const cells = await row.locator('th, td').all();
-  if (cells.length < 2) return null;
-  const deviceText = (await cells[0].innerText().catch(() => '')).trim();
-  const locationText = (await cells[1].innerText().catch(() => '')).trim();
-  const isCurrent = deviceText.toLowerCase().includes('current') ||
-                    (await row.locator('text=Current').count()) > 0 ||
-                    (await row.locator('button[aria-label*="current session"]').count()) > 0;
-  return { deviceText, locationText, isCurrent };
+async function rereadRow(row, columns) {
+  return readRow(row, columns);
 }
 
 // Perform a single scan and termination pass
@@ -413,7 +481,7 @@ async function performScan(page, options, checkNumber) {
   try {
     await page.waitForSelector('text=Active sessions', { timeout: 15000 });
   } catch (err) {
-    console.error(`[${time}] Could not find "Active sessions" table. Re-checking on next interval.`);
+    console.error(`[${time}] Could not find the "Active sessions" section. Re-checking on next interval.`);
     return { scanned: 0, kept: 0, terminated: 0 };
   }
 
@@ -426,6 +494,19 @@ async function performScan(page, options, checkNumber) {
     await page.waitForTimeout(1000);
   } catch (e) {}
 
+  // Scope everything below to the Active sessions table alone. The page also
+  // renders a "Trusted devices" table (Device | Added) above it; scanning that
+  // would read an "Added" date as a location and flag a trusted device.
+  const table = await locateSessionsTable(page);
+  if (!table) {
+    console.error(`[${time}] Could not identify the Active sessions table. Nothing scanned.`);
+    return { scanned: 0, kept: 0, terminated: 0 };
+  }
+  if (table.columns.device < 0 || table.columns.location < 0) {
+    console.error(`[${time}] Active sessions table has unexpected columns [${table.headers.join(', ')}]. Nothing scanned.`);
+    return { scanned: 0, kept: 0, terminated: 0 };
+  }
+
   let terminatedCount = 0;
   let keptCount = 0;
   const processedKeys = new Set();
@@ -434,8 +515,10 @@ async function performScan(page, options, checkNumber) {
   while (continueScanning) {
     continueScanning = false;
 
-    const rows = await page.locator('table tr').all();
-    if (rows.length <= 1) {
+    // Re-tag each round: the page re-renders rows after a termination.
+    const located = await locateSessionsTable(page) || table;
+    const rows = await sessionRowLocator(page, located).all();
+    if (rows.length === 0) {
       break;
     }
 
@@ -444,18 +527,10 @@ async function performScan(page, options, checkNumber) {
     let readableRows = 0;
     let keepableRows = 0;
 
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const cells = await row.locator('th, td').all();
-      if (cells.length < 2) continue;
-
-      const deviceText = (await cells[0].innerText().catch(() => '')).trim();
-      const locationText = (await cells[1].innerText().catch(() => '')).trim();
-      const createdText = cells.length >= 3 ? (await cells[2].innerText().catch(() => '')).trim() : '';
-
-      const isCurrent = deviceText.toLowerCase().includes('current') ||
-                        (await row.locator('text=Current').count()) > 0 ||
-                        (await row.locator('button[aria-label*="current session"]').count()) > 0;
+    for (const row of rows) {
+      const data = await readRow(row, located.columns);
+      if (!data) continue;
+      const { deviceText, locationText, createdText, isCurrent } = data;
 
       const sessionKey = `${deviceText}_${locationText}_${createdText}`;
       const verdict = classifySession({ deviceText, locationText, isCurrent }, options.allowedLocations);
@@ -501,7 +576,7 @@ async function performScan(page, options, checkNumber) {
         // Last-moment re-read: the table may have re-rendered between reading
         // the row and acting on it. Only proceed if the row still says the same
         // thing and still classifies as unprotected.
-        const recheck = await rereadRow(rowToTerminate).catch(() => null);
+        const recheck = await rereadRow(rowToTerminate, located.columns).catch(() => null);
         if (!recheck) {
           console.warn('  [SKIP] Row vanished before termination - re-scanning next round.');
           continueScanning = true;
@@ -519,7 +594,7 @@ async function performScan(page, options, checkNumber) {
         console.log(`  [TERMINATING] ${deviceText} | Location: ${locationText || 'Unknown'} | Created: ${createdText}...`);
 
         try {
-          const actionBtn = rowToTerminate.locator('button[aria-haspopup="menu"], button[aria-label*="Session actions"], button').first();
+          const actionBtn = rowToTerminate.locator('button[aria-label^="Session actions"], button[aria-haspopup="menu"], button').first();
           await actionBtn.scrollIntoViewIfNeeded();
           await safeClick(actionBtn, 'the row action button');
           await page.waitForTimeout(500);
@@ -572,20 +647,16 @@ async function performScan(page, options, checkNumber) {
 
   // Finish collecting any remaining rows if in dry run
   if (options.dryRun) {
-    const rows = await page.locator('table tr').all();
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const cells = await row.locator('th, td').all();
-      if (cells.length < 2) continue;
-
-      const deviceText = (await cells[0].innerText().catch(() => '')).trim();
-      const locationText = (await cells[1].innerText().catch(() => '')).trim();
-      const createdText = cells.length >= 3 ? (await cells[2].innerText().catch(() => '')).trim() : '';
+    const located = await locateSessionsTable(page) || table;
+    const rows = await sessionRowLocator(page, located).all();
+    for (const row of rows) {
+      const data = await readRow(row, located.columns);
+      if (!data) continue;
+      const { deviceText, locationText, createdText, isCurrent } = data;
       const sessionKey = `${deviceText}_${locationText}_${createdText}`;
 
       if (processedKeys.has(sessionKey)) continue;
 
-      const isCurrent = deviceText.toLowerCase().includes('current') || (await row.locator('text=Current').count()) > 0;
       const verdict = classifySession({ deviceText, locationText, isCurrent }, options.allowedLocations);
 
       if (verdict.keep) {
@@ -1104,5 +1175,7 @@ module.exports = {
   installLogoutGuard,
   safeClick,
   confirmTermination,
+  locateSessionsTable,
+  readAllRows,
   PROTECTED_LOCATIONS
 };

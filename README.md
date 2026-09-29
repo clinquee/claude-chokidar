@@ -59,17 +59,24 @@ node index.js --allow "oslo,pune"
 
 ## Safety rules
 
-Beyond the location list, four rules make a wrong termination hard:
+Beyond the location list, five rules make a wrong termination hard:
 
-1. **Unknown location = keep.** If the location cell is blank or unreadable
+1. **Only the Active sessions table is ever read.** The account page also lists
+   **Trusted devices** (`Device | Added`) just above it. Read blindly, a trusted
+   device's `Added` date would be parsed as its location, making it look like an
+   unprotected session. The bot locates the table under the `Active sessions`
+   heading, maps columns by their header names (so an added column such as
+   `Updated` changes nothing), and scans nothing else. If that table cannot be
+   identified, the round is skipped entirely.
+2. **Unknown location = keep.** If the location cell is blank or unreadable
    (slow render, layout change), the row is kept, never terminated.
-2. **Re-check before acting.** The row is re-read from the live DOM immediately
+3. **Re-check before acting.** The row is re-read from the live DOM immediately
    before the terminate click. If it now reads differently, or now classifies as
    protected, the bot skips it and re-scans.
-3. **Runaway guard.** If *every* row looks unprotected — impossible on a healthy
+4. **Runaway guard.** If *every* row looks unprotected — impossible on a healthy
    account, since the current session is always protected — the bot assumes it
    misread the page and terminates nothing that round.
-4. **"Log out" can never be clicked.** The account page carries a plain
+5. **"Log out" can never be clicked.** The account page carries a plain
    `Log out` button (and on some accounts `Log out of all devices`), which would
    end sessions this bot exists to protect. Two independent layers stop it: a
    capture-phase listener injected into the page swallows any click on a logout

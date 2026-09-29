@@ -382,19 +382,111 @@ async def confirm_termination(page, timeout_seconds=8.0):
     return True
 
 
-async def read_all_rows(page):
-    """Read every session row's text in one pass (device, location, created)."""
-    rows = await page.locator("table tr").all()
+# Only the table under the "Active sessions" heading may ever be touched. The
+# account page also renders a "Trusted devices" table (Device | Added) directly
+# above it, whose "Added" date would otherwise be read as a location and the row
+# treated as an unprotected session.
+SESSIONS_TABLE = 'table[data-chokidar-sessions="1"]'
+
+LOCATE_SESSIONS_TABLE_JS = r"""
+() => {
+  const txt = el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+
+  document.querySelectorAll('[data-chokidar-sessions]')
+    .forEach(el => el.removeAttribute('data-chokidar-sessions'));
+
+  const heading = [...document.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+    .find(el => /^active sessions$/i.test(txt(el)));
+  if (!heading) return null;
+
+  const section = heading.closest('section') || heading.parentElement;
+  let table = section ? section.querySelector('table') : null;
+  if (!table) {
+    table = [...document.querySelectorAll('table')].find(t =>
+      heading.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING) || null;
+  }
+  if (!table) return null;
+
+  const headRow = table.querySelector('thead tr') || table.querySelector('tr');
+  if (!headRow) return null;
+  const headers = [...headRow.querySelectorAll('th, td')].map(txt);
+
+  const indexOf = name => headers.findIndex(h => new RegExp('^' + name + '$', 'i').test(h));
+  const columns = {
+    device: indexOf('device'),
+    location: indexOf('location'),
+    created: indexOf('created')
+  };
+
+  table.setAttribute('data-chokidar-sessions', '1');
+  return { headers, columns, hasThead: !!table.querySelector('thead') };
+}
+"""
+
+
+async def locate_sessions_table(page):
+    """Find the Active sessions table, tag it so locators can be scoped to it,
+    and report which column holds what. Returns None when it cannot be
+    identified, in which case the caller must do nothing this round."""
+    try:
+        return await page.evaluate(LOCATE_SESSIONS_TABLE_JS)
+    except Exception:
+        return None
+
+
+def session_row_locator(page, table):
+    """Rows of the Active sessions table only (never the header row)."""
+    if table and table.get("hasThead"):
+        return page.locator(f"{SESSIONS_TABLE} tbody tr")
+    return page.locator(f"{SESSIONS_TABLE} tr:not(:first-child)")
+
+
+async def read_row(row, columns):
+    """Read one row using the column positions reported by locate_sessions_table."""
+    # A header row has no <td> cells; parsing one would read "Location" as a
+    # location and mark the header as an unprotected session.
+    if await row.locator("td").count() == 0:
+        return None
+
+    cells = await row.locator("th, td").all()
+
+    async def cell_text(i):
+        if i is None or i < 0 or i >= len(cells):
+            return ""
+        try:
+            return (await cells[i].inner_text()).strip()
+        except Exception:
+            return ""
+
+    device_text = await cell_text(columns.get("device"))
+    location_text = await cell_text(columns.get("location"))
+    created_text = await cell_text(columns.get("created"))
+    if not device_text and not location_text:
+        return None
+
+    is_current = ("current" in device_text.lower()
+                  or await row.locator("text=Current").count() > 0
+                  or await row.locator('button[aria-label*="current session"]').count() > 0)
+
+    return {
+        "deviceText": device_text,
+        "locationText": location_text,
+        "createdText": created_text,
+        "isCurrent": is_current,
+    }
+
+
+async def read_all_rows(page, table=None):
+    """Read every Active sessions row (device, location, created)."""
+    located = table or await locate_sessions_table(page)
+    if not located:
+        return []
+    rows = await session_row_locator(page, located).all()
     out = []
-    for i in range(1, len(rows)):
-        cells = await rows[i].locator("th, td").all()
-        if len(cells) < 2:
-            continue
-        out.append({
-            "deviceText": (await cells[0].inner_text()).strip(),
-            "locationText": (await cells[1].inner_text()).strip(),
-            "createdText": (await cells[2].inner_text()).strip() if len(cells) >= 3 else "",
-        })
+    for row in rows:
+        data = await read_row(row, located["columns"])
+        if data:
+            out.append(data)
     return out
 
 
@@ -417,17 +509,12 @@ async def first_visible(page, candidates, timeout_seconds=5.0):
     return None
 
 
-async def reread_row(row):
+async def reread_row(row, columns):
     """Re-read a row's cells straight from the live DOM (used right before acting)."""
-    cells = await row.locator("th, td").all()
-    if len(cells) < 2:
+    data = await read_row(row, columns)
+    if not data:
         return None
-    dev_text = (await cells[0].inner_text()).strip()
-    loc_text = (await cells[1].inner_text()).strip()
-    is_current = ("current" in dev_text.lower() or
-                  await row.locator("text=Current").count() > 0 or
-                  await row.locator('button[aria-label*="current session"]').count() > 0)
-    return dev_text, loc_text, is_current
+    return data["deviceText"], data["locationText"], data["isCurrent"]
 
 
 async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_num: int):
@@ -465,6 +552,18 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
     except Exception:
         pass
 
+    # Scope everything below to the Active sessions table alone. The page also
+    # renders a "Trusted devices" table (Device | Added) above it; scanning that
+    # would read an "Added" date as a location and flag a trusted device.
+    table = await locate_sessions_table(page)
+    if not table:
+        print(f"[{time_str}] Could not identify the Active sessions table. Nothing scanned.")
+        return
+    if table["columns"]["device"] < 0 or table["columns"]["location"] < 0:
+        print(f"[{time_str}] Active sessions table has unexpected columns "
+              f"[{', '.join(table['headers'])}]. Nothing scanned.")
+        return
+
     terminated_count = 0
     kept_count = 0
     processed_keys: Set[str] = set()
@@ -472,9 +571,11 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
     continue_scanning = True
     while continue_scanning:
         continue_scanning = False
-        rows = await page.locator("table tr").all()
+        # Re-tag each round: the page re-renders rows after a termination.
+        located = await locate_sessions_table(page) or table
+        rows = await session_row_locator(page, located).all()
 
-        if len(rows) <= 1:
+        if len(rows) == 0:
             break
 
         row_to_terminate = None
@@ -482,19 +583,14 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
         readable_rows = 0
         keepable_rows = 0
 
-        for i in range(1, len(rows)):
-            row = rows[i]
-            cells = await row.locator("th, td").all()
-            if len(cells) < 2:
+        for row in rows:
+            data = await read_row(row, located["columns"])
+            if not data:
                 continue
-
-            dev_text = (await cells[0].inner_text()).strip()
-            loc_text = (await cells[1].inner_text()).strip()
-            created_text = (await cells[2].inner_text()).strip() if len(cells) >= 3 else ""
-
-            is_current = ("current" in dev_text.lower() or
-                          await row.locator("text=Current").count() > 0 or
-                          await row.locator('button[aria-label*="current session"]').count() > 0)
+            dev_text = data["deviceText"]
+            loc_text = data["locationText"]
+            created_text = data["createdText"]
+            is_current = data["isCurrent"]
 
             s_key = f"{dev_text}_{loc_text}_{created_text}"
             keep, reason = classify_session(dev_text, loc_text, is_current, allowed_locations)
@@ -541,7 +637,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                 # Last-moment re-read: the table may have re-rendered since it was
                 # scanned. Only act if the row still reads the same and still
                 # classifies as unprotected.
-                recheck = await reread_row(row_to_terminate)
+                recheck = await reread_row(row_to_terminate, located['columns'])
                 if recheck is None:
                     print("  [SKIP] Row vanished before termination - re-scanning next round.")
                     continue_scanning = True
@@ -559,7 +655,7 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                 print(f"  [TERMINATING] {dev} | Location: {loc or 'Unknown'} | Created: {created}...")
                 try:
                     action_btn = row_to_terminate.locator(
-                        'button[aria-haspopup="menu"], button[aria-label*="Session actions"], button'
+                        'button[aria-label^="Session actions"], button[aria-haspopup="menu"], button'
                     ).first
                     await action_btn.scroll_into_view_if_needed()
                     await safe_click(action_btn, "the row action button")
@@ -607,21 +703,20 @@ async def perform_scan(page, allowed_locations: List[str], dry_run: bool, check_
                     print(f"  --> Error terminating session: {term_err}")
 
     if dry_run:
-        rows = await page.locator("table tr").all()
-        for i in range(1, len(rows)):
-            row = rows[i]
-            cells = await row.locator("th, td").all()
-            if len(cells) < 2:
+        located = await locate_sessions_table(page) or table
+        rows = await session_row_locator(page, located).all()
+        for row in rows:
+            data = await read_row(row, located["columns"])
+            if not data:
                 continue
-            dev = (await cells[0].inner_text()).strip()
-            loc = (await cells[1].inner_text()).strip()
-            created = (await cells[2].inner_text()).strip() if len(cells) >= 3 else ""
+            dev = data["deviceText"]
+            loc = data["locationText"]
+            created = data["createdText"]
+            is_curr = data["isCurrent"]
             s_key = f"{dev}_{loc}_{created}"
 
             if s_key in processed_keys:
                 continue
-
-            is_curr = "current" in dev.lower() or await row.locator("text=Current").count() > 0
             keep, reason = classify_session(dev, loc, is_curr, allowed_locations)
             if keep:
                 print(f"  [KEEP]  {dev.replace(chr(10), ' ')} | Location: {loc or 'N/A'} | {reason}")
