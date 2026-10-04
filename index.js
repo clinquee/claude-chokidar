@@ -460,25 +460,22 @@ async function performScan(page, options, checkNumber) {
 
   // Ensure settings account page is loaded and fresh
   try {
-    const currentUrl = page.url();
-    if (!currentUrl.includes('/settings/account')) {
-      await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    } else {
-      // Reload page to get fresh session data from server
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-    }
+    await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch (e) {
     console.warn(`[${time}] Navigation warning: ${e.message}`);
   }
 
-  // Re-arm the guard after every navigation/reload.
+  // Re-arm the guard after navigation.
   await installLogoutGuard(page);
 
-  // Ensure "Active sessions" is visible
+  // Ensure "Active sessions" is visible (give Claude's React app a moment to hydrate)
   let activeSessionsHeader = page.locator('text=Active sessions');
   if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
-    await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
+    if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
+      await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
+    }
   }
 
   try {
@@ -972,15 +969,12 @@ async function openBrowser(options) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--renderer-process-limit=1',
       '--disable-extensions',
       '--disable-background-networking',
       '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows',
       '--disable-breakpad',
-      '--disable-component-update',
-      '--js-flags=--max-old-space-size=128'
+      '--disable-component-update'
     );
   }
 
@@ -1201,6 +1195,24 @@ async function main() {
         stats.kept += result.kept;
       } catch (scanErr) {
         console.error(`[${getTimestamp()}] Scan error: ${scanErr.message}. Will retry on next interval.`);
+        if (scanErr.message && scanErr.message.includes('crash') && !isCdp) {
+          console.log(`[${getTimestamp()}] Detected page/target crash. Recovering browser session...`);
+          try {
+            if (page) await page.close().catch(() => {});
+            if (context) await context.close().catch(() => {});
+          } catch (e) {}
+          try {
+            const reopened = await openBrowser(options);
+            browser = reopened.browser;
+            context = reopened.context;
+            page = reopened.page;
+            await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await installLogoutGuard(page);
+            console.log(`[${getTimestamp()}] Session recovered successfully.`);
+          } catch (recErr) {
+            console.error(`[${getTimestamp()}] Recovery failed: ${recErr.message}. Retrying next interval.`);
+          }
+        }
       }
 
       if (options.once) {
