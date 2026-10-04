@@ -946,6 +946,14 @@ async function openBrowser(options) {
 
   if (!fs.existsSync(options.userDataDir)) {
     fs.mkdirSync(options.userDataDir, { recursive: true });
+  } else {
+    // Clean stale lock files if previous process terminated abruptly
+    ['SingletonLock', 'SingletonCookie', 'SingletonSocket'].forEach(f => {
+      try {
+        const p = path.join(options.userDataDir, f);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch (e) {}
+    });
   }
 
   const launchOptions = {
@@ -958,8 +966,22 @@ async function openBrowser(options) {
     ]
   };
 
-  if (process.platform === 'linux' || process.env.CI) {
-    launchOptions.args.push('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
+  if (process.platform === 'linux' || process.env.CI || options.headless) {
+    launchOptions.args.push(
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--renderer-process-limit=1',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-breakpad',
+      '--disable-component-update',
+      '--js-flags=--max-old-space-size=128'
+    );
   }
 
   // Headless Chrome configuration to avoid bot fingerprinting
@@ -1184,6 +1206,23 @@ async function main() {
       if (options.once) {
         console.log('\nSingle scan completed (--once). Exiting.');
         break;
+      }
+
+      // Memory leak guard: periodically recycle page/browser to stay well under 512MB
+      const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+      if (checkCount > 1 && (checkCount % 10 === 0 || memMb > 250) && !isCdp) {
+        console.log(`[${getTimestamp()}] Memory check: ${memMb}MB RSS. Recycling browser to keep memory low...`);
+        try {
+          if (page) await page.close().catch(() => {});
+          if (context) await context.close().catch(() => {});
+        } catch (e) {}
+        const reopened = await openBrowser(options);
+        browser = reopened.browser;
+        context = reopened.context;
+        page = reopened.page;
+        await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await installLogoutGuard(page);
+        console.log(`[${getTimestamp()}] Browser recycled successfully.`);
       }
 
       console.log(`\n⏳ Next check in ${options.interval}s (Press Ctrl+C to stop)...`);

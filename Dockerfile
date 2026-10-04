@@ -11,6 +11,7 @@ COPY . .
 
 # Cloud platforms (Render, Koyeb, etc.) assign a PORT environment variable
 ENV PORT=8080
+ENV NODE_OPTIONS="--max-old-space-size=128"
 EXPOSE 8080
 
 CMD ["node", "index.js", "--headless", "--interval", "60", "--separate-profile"]
