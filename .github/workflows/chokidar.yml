@@ -1,0 +1,58 @@
+name: Claude Chokidar Watchdog
+
+on:
+  schedule:
+    # Run every 15 minutes (GitHub Actions minimum recommended cron frequency)
+    - cron: '* * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview sessions without terminating)'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: claude-chokidar
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    name: Scan & Protect Sessions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      - name: Run Claude Chokidar
+        env:
+          SESSION_KEY: ${{ secrets.SESSION_KEY }}
+          CLAUDE_SESSION_KEY: ${{ secrets.SESSION_KEY }}
+          SESSION_KEYV3: ${{ secrets.SESSION_KEYV3 }}
+          SESSION_KEYLC: ${{ secrets.SESSION_KEYLC }}
+          SESSION_KEYV3LC: ${{ secrets.SESSION_KEYV3LC }}
+        run: |
+          FLAGS="--headless --once --separate-profile"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+          fi
+
+          if [ -n "${{ secrets.ALLOWED_LOCATIONS }}" ]; then
+            FLAGS="$FLAGS --allow \"${{ secrets.ALLOWED_LOCATIONS }}\""
+          fi
+
+          eval "node index.js $FLAGS"

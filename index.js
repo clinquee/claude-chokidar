@@ -36,6 +36,7 @@ function parseArgs() {
     allowedLocations: [...PROTECTED_LOCATIONS],
     cdpPort: null,
     userDataDir: path.resolve(__dirname, 'chrome_session'),
+    cleanSession: false,
     headless: false,
     interval: 60, // Default 60 seconds (1 minute)
     once: false,
@@ -95,6 +96,8 @@ function parseArgs() {
       options.userDataDir = path.resolve(arg.split('=')[1]);
     } else if (arg === '--headless') {
       options.headless = true;
+    } else if (arg === '--clean-session') {
+      options.cleanSession = true;
     } else if (arg === '--list-profiles') {
       options.listProfiles = true;
     } else if (arg === '--help' || arg === '-h') {
@@ -935,6 +938,12 @@ async function openBrowser(options) {
     }
   }
 
+  if (options.cleanSession && fs.existsSync(options.userDataDir)) {
+    try {
+      fs.rmSync(options.userDataDir, { recursive: true, force: true });
+    } catch (e) {}
+  }
+
   if (!fs.existsSync(options.userDataDir)) {
     fs.mkdirSync(options.userDataDir, { recursive: true });
   }
@@ -949,23 +958,27 @@ async function openBrowser(options) {
     ]
   };
 
-  // Headless Chrome otherwise advertises itself as "HeadlessChrome" in the
-  // user-agent, which claude.ai's Cloudflare layer answers with a "Just a
-  // moment" challenge - so the cookie never reaches a signed-in page and the
-  // bot wrongly reports it as expired. Present the same UA a normal window
-  // would, so a headless run authenticates exactly like a windowed one.
+  if (process.platform === 'linux' || process.env.CI) {
+    launchOptions.args.push('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
+  }
+
+  // Headless Chrome configuration to avoid bot fingerprinting
   if (options.headless) {
     launchOptions.userAgent =
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
       '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
-    launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
   }
 
   if (chromePath) {
-    result.context = await chromium.launchPersistentContext(options.userDataDir, {
-      ...launchOptions,
-      executablePath: chromePath
-    });
+    try {
+      result.context = await chromium.launchPersistentContext(options.userDataDir, {
+        ...launchOptions,
+        executablePath: chromePath
+      });
+    } catch (err) {
+      console.warn(`Could not launch local Chrome at ${chromePath}: ${err.message}. Trying Playwright Chromium...`);
+      result.context = await chromium.launchPersistentContext(options.userDataDir, launchOptions);
+    }
   } else {
     try {
       result.context = await chromium.launchPersistentContext(options.userDataDir, {
@@ -976,6 +989,15 @@ async function openBrowser(options) {
       result.context = await chromium.launchPersistentContext(options.userDataDir, launchOptions);
     }
   }
+
+  // Mask automation properties from detection layers
+  await result.context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      if (!window.chrome) window.chrome = {};
+      if (!window.chrome.runtime) window.chrome.runtime = {};
+    } catch (e) {}
+  });
 
   const sessionCookies = readSessionCookies(options.sessionKey);
   if (sessionCookies.length) {
@@ -1033,10 +1055,31 @@ async function main() {
   // Running totals across every scan this session, printed as one line on exit.
   const stats = { scans: 0, terminated: 0, kept: 0, startedAt: Date.now() };
 
+  let cloudServer = null;
+  if (process.env.PORT) {
+    const port = parseInt(process.env.PORT, 10);
+    cloudServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        uptimeSeconds: Math.round((Date.now() - stats.startedAt) / 1000),
+        scans: stats.scans,
+        kept: stats.kept,
+        terminated: stats.terminated
+      }));
+    });
+    cloudServer.listen(port, () => {
+      console.log(`Cloud keep-alive health check server listening on port ${port}`);
+    });
+  }
+
   // Graceful shutdown handler
   async function cleanup() {
     if (isShuttingDown) return;
     isShuttingDown = true;
+    if (cloudServer) {
+      cloudServer.close();
+    }
     console.log('\n\nStopping bot and cleaning up browser session...');
     const mins = Math.round((Date.now() - stats.startedAt) / 60000);
     const verb = options.dryRun ? 'Flagged' : 'Terminated';
@@ -1071,7 +1114,7 @@ async function main() {
     console.log('Checking authentication status...');
     let loggedIn = false;
     let promptedForLogin = false;
-    const maxWaitTime = 300000; // 5 minutes to finish a manual sign-in
+    const maxWaitTime = (options.headless || process.env.CI) ? 30000 : 300000;
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitTime && !isShuttingDown) {
