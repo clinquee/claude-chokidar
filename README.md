@@ -33,26 +33,36 @@ add another device to your session list.
 
 ## Protected locations
 
-These are **always protected** and can never be terminated. They are hard-coded
-in `index.js` (`PROTECTED_LOCATIONS`); the `--allow` flag can only *add* more
-locations, never remove one:
+The rule is decided by the **country** Claude shows at the end of the location:
+
+- **Outside India: always kept.** Any session whose location ends in a country
+  other than India (`NO`, `US`, `GB`, ...) is never terminated. So is any
+  location that shows no country at all.
+- **Inside India (`..., IN`): only these cities are kept.** Every other Indian
+  city (Pune, Nashik, Latur, Delhi, ...) is terminated.
+
+The Indian cities are hard-coded in `index.js` and `main.py`
+(`PROTECTED_LOCATIONS`). The `--allow` flag can only *add* cities, never remove
+one:
 
 | | Location | Matches, for example |
 |---|---|---|
+| ✅ | anywhere outside India | `Bergen, Vestland, NO`, `London, England, GB` |
 | ✅ | Mumbai | `Mumbai, Maharashtra, IN` |
 | ✅ | Navi Mumbai | `Navi Mumbai, Maharashtra, IN` |
 | ✅ | Panvel | `Panvel, Maharashtra, IN` |
-| ✅ | Bergen | `Bergen, Vestland, NO` |
+| ✅ | Thane | `Thane, Maharashtra, IN` |
 | ✅ | The current session | the browser the bot itself is using |
-| ❌ | anything else | terminated |
+| ❌ | any other city in India | `Pune, Maharashtra, IN`, `Nashik, Maharashtra, IN` |
 
-Matching is case-insensitive and substring-based, so a city matches regardless
-of the state/country suffix Claude appends.
+India is detected only when the **last** comma-separated part is exactly `IN`
+or `India` and a city comes before it, so `Indianapolis, Indiana, US` is not
+mistaken for India. City matching is case-insensitive and substring-based.
 
-To protect an extra city without touching the code:
+To protect an extra Indian city without touching the code:
 
 ```bash
-node index.js --allow "oslo,pune"
+node index.js --allow "pune,nashik"
 ```
 
 ---
@@ -174,7 +184,7 @@ npm run dry-run
 Expected output:
 
 ```
-Protected (always): mumbai, navi mumbai, bergen, panvel
+Protected (always): outside India, and in India: mumbai, navi mumbai, panvel, thane
 Mode              : DRY-RUN (Preview only)
 
 Using your local Chrome: C:\Program Files\Google\Chrome\Application\chrome.exe
@@ -184,8 +194,8 @@ Safety guard armed: every "Log out" control is blocked in this window.
 [17:13:55] Check #1: Inspecting active sessions...
   [KEEP]  Chrome (Mac OS X)        | Location: Mumbai, Maharashtra, IN | Protected location
   [KEEP]  Chrome (Windows) Current | Location: Mumbai, Maharashtra, IN | Current session
-  [KEEP]  Claude (iOS)             | Location: Bergen, Vestland, NO    | Protected location
-  [WOULD TERMINATE] Chrome (Linux) | Location: Delhi, IN | Created: ...
+  [KEEP]  Claude (iOS)             | Location: Bergen, Vestland, NO    | Outside India (or country not shown)
+  [WOULD TERMINATE] Chrome (Linux) | Location: Pune, Maharashtra, IN | Created: ...
 [17:13:55] Check complete. Total: 4 | Kept: 3 | Flagged: 1
 ```
 
@@ -215,19 +225,26 @@ npm run bot:dry-run  # keep scanning, terminate nothing (monitoring mode)
 
 Pick a ready-made interval:
 
-| Interval | Command | Equivalent |
+| Interval | Command | Headless (no window) |
 |---|---|---|
-| Every 30 seconds | `npm run bot:30s` | `node index.js --interval 30` |
-| **Every 1 minute** (default) | `npm run bot:1m` or `npm start` | `node index.js --interval 60` |
-| Every 5 minutes | `npm run bot:5m` | `node index.js --interval 300` |
-| Every 10 minutes | `npm run bot:10m` | `node index.js --interval 600` |
-| Every 15 minutes | `npm run bot:15m` | `node index.js --interval 900` |
+| Every 30 seconds | `npm run bot:30s` | `npm run bot:30s:headless` |
+| **Every 1 minute** (default) | `npm run bot:1m` or `npm start` | `npm run bot:1m:headless` |
+| Every 2 minutes | `npm run bot:2m` | `npm run bot:2m:headless` |
+| Every 3 minutes | `npm run bot:3m` | `npm run bot:3m:headless` |
+| Every 4 minutes | `npm run bot:4m` | `npm run bot:4m:headless` |
+| Every 5 minutes | `npm run bot:5m` | `npm run bot:5m:headless` |
+| Every *N* minutes (1–60) | `npm run bot:<N>m` | `npm run bot:<N>m:headless` |
 
-Or set any interval you like, in **seconds**:
+Every whole minute from `bot:1m` to `bot:60m` exists, each with a `:headless`
+variant. Any other flag can be passed after `--`, e.g.
+`npm run bot:7m -- --dry-run`.
+
+Or set any interval you like, in seconds or with a unit (`s`, `m`, `h`):
 
 ```bash
 node index.js --interval 120     # every 2 minutes
-node index.js --interval 1800    # every 30 minutes
+node index.js --interval 90m     # every 90 minutes
+node index.js --interval 2h --headless
 node index.js --interval 3600    # every hour
 ```
 
@@ -283,10 +300,11 @@ pm2 save && pm2 startup     # survive reboots
 ```text
 Usage: node index.js [options]
 
-  --interval, -i <sec>    Seconds between scans (default: 60)
+  --interval, -i <time>   Time between scans: seconds, or 90s / 7m / 2h
+                          (default: 60)
   --once                  Run a single scan and exit
   --dry-run               Preview only; never terminates anything
-  --allow, -a <list>      Extra protected locations, comma-separated.
+  --allow, -a <list>      Extra protected Indian cities, comma-separated.
                           ADDED to the always-protected list; the built-in
                           protected locations cannot be disabled.
   --session-key <value>   Session cookie to use (overrides .env)
@@ -304,8 +322,8 @@ Usage: node index.js [options]
 Examples:
 
 ```bash
-# Every 15 minutes, headless, also protecting Oslo
-node index.js --interval 900 --headless --allow "oslo"
+# Every 15 minutes, headless, also protecting Pune
+node index.js --interval 900 --headless --allow "pune"
 
 # Use a different Chrome profile
 node index.js --chrome-profile you@example.com

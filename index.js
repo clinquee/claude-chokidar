@@ -19,14 +19,26 @@ const fs = require('fs');
 const { spawn, execFileSync } = require('child_process');
 const chromeProfile = require('./chromeProfile');
 
-// Locations that are ALWAYS protected. These can never be removed by --allow;
-// --allow only adds more. Matching is case-insensitive substring matching, so
-// "Mumbai, Maharashtra, IN" and "Bergen, Vestland, NO" both match.
-const PROTECTED_LOCATIONS = ['mumbai', 'navi mumbai', 'bergen', 'panvel'];
+// Only sessions located in India are ever candidates for termination; anything
+// outside India is always kept. Inside India, these cities are ALWAYS protected
+// and can never be removed by --allow (--allow only adds more). Matching is
+// case-insensitive substring matching, so "Mumbai, Maharashtra, IN" matches.
+const PROTECTED_LOCATIONS = ['mumbai', 'navi mumbai', 'panvel', 'thane'];
+
+// Country suffixes Claude may append for India ("Pune, Maharashtra, IN").
+const INDIA_COUNTRY_NAMES = ['in', 'india'];
 
 // Chrome profile used by default (matched against profile dir, display name or
 // account email in Chrome's "Local State").
 const DEFAULT_CHROME_PROFILE = 'shreyans.tatiya@gmail.com';
+
+// Parse an interval like "300", "90s", "7m" or "2h" into seconds (null if invalid).
+function parseInterval(value) {
+  const match = /^(\d+)\s*([smh]?)$/i.exec(String(value || '').trim());
+  if (!match) return null;
+  const seconds = parseInt(match[1], 10) * { '': 1, s: 1, m: 60, h: 3600 }[match[2].toLowerCase()];
+  return seconds > 0 ? seconds : null;
+}
 
 // Parse command line arguments
 function parseArgs() {
@@ -56,13 +68,13 @@ function parseArgs() {
     } else if (arg === '--once') {
       options.once = true;
     } else if (arg === '--interval' || arg === '-i') {
-      const val = parseInt(args[++i], 10);
-      if (!isNaN(val) && val > 0) {
+      const val = parseInterval(args[++i]);
+      if (val) {
         options.interval = val;
       }
     } else if (arg.startsWith('--interval=')) {
-      const val = parseInt(arg.split('=')[1], 10);
-      if (!isNaN(val) && val > 0) {
+      const val = parseInterval(arg.split('=')[1]);
+      if (val) {
         options.interval = val;
       }
     } else if (arg === '--allow' || arg === '-a') {
@@ -116,14 +128,16 @@ Claude Active Sessions Terminator Bot (Playwright)
 Usage:
   node index.js [options]
 
-Always-protected locations (can never be terminated, cannot be disabled):
+Sessions outside India are never terminated. Inside India, these cities are
+always protected (cannot be disabled):
   ${PROTECTED_LOCATIONS.join(', ')}
 
 Options:
-  --interval, -i <sec>      Check interval in seconds (default: 60 = 1 minute bot)
+  --interval, -i <time>     Check interval: seconds, or with a unit like 90s, 7m, 2h
+                            (default: 60 = 1 minute bot)
   --once                    Run a single scan and exit (disables recurring bot loop)
   --dry-run                 Preview sessions without actually terminating them
-  --allow, -a <locations>   Extra protected locations, comma-separated (case-insensitive).
+  --allow, -a <locations>   Extra protected Indian cities, comma-separated (case-insensitive).
                             These are ADDED to the always-protected list above.
   --chrome-profile <name>   Local Chrome profile: folder name, display name or account
                             email (default: "${DEFAULT_CHROME_PROFILE}")
@@ -149,6 +163,9 @@ Examples:
   node index.js --interval 300    # every 5 minutes  (npm run bot:5m)
   node index.js --interval 600    # every 10 minutes (npm run bot:10m)
   node index.js --interval 900    # every 15 minutes (npm run bot:15m)
+  node index.js --interval 7m     # units work too: 90s, 7m, 2h
+  # npm run bot:<1-60>m runs every N minutes; add :headless for no window,
+  # e.g. npm run bot:3m:headless
 
   # 4. Single-run scan and exit:
   node index.js --once
@@ -195,10 +212,20 @@ function isPortOpen(port) {
   });
 }
 
-// Check if a location string matches any of the allowed locations.
+// True only when the location's last comma-separated part is India's country
+// code/name AND a city precedes it. Anything else - another country, no country,
+// a bare "IN" - is not treated as India, so it is never terminated.
+function isInIndia(location) {
+  const parts = String(location || '').split(',').map(p => p.trim().toLowerCase()).filter(Boolean);
+  return parts.length >= 2 && INDIA_COUNTRY_NAMES.includes(parts[parts.length - 1]);
+}
+
+// Check if a location string is allowed: everything outside India is, and inside
+// India only the protected cities (plus any --allow extras) are.
 // The always-protected list is checked too, even if a caller passes a narrower list.
 function isLocationAllowed(location, allowedLocations) {
   if (!location) return false;
+  if (!isInIndia(location)) return true;
   const locLower = location.toLowerCase();
   const list = [...new Set([...PROTECTED_LOCATIONS, ...(allowedLocations || [])])];
   return list.some(allowed => locLower.includes(String(allowed).toLowerCase()));
@@ -221,6 +248,10 @@ function classifySession({ deviceText, locationText, isCurrent }, allowedLocatio
   // extra column) must never be terminated - we simply do not know where it is.
   if (!location || location === '-' || location === '--') {
     return { keep: true, reason: 'Location unknown - kept for safety' };
+  }
+
+  if (!isInIndia(location)) {
+    return { keep: true, reason: 'Outside India (or country not shown)' };
   }
 
   if (isLocationAllowed(location, allowedLocations)) {
@@ -1053,11 +1084,11 @@ async function main() {
   console.log('='.repeat(65));
   console.log('  Claude Active Sessions Manager - Bot Mode');
   console.log('='.repeat(65));
-  console.log(`Protected (always): ${PROTECTED_LOCATIONS.join(', ')}`);
+  console.log(`Protected (always): outside India, and in India: ${PROTECTED_LOCATIONS.join(', ')}`);
   const extras = options.allowedLocations.filter(l => !PROTECTED_LOCATIONS.includes(l));
   if (extras.length) console.log(`Protected (extra) : ${extras.join(', ')}`);
   console.log(`Mode              : ${options.dryRun ? 'DRY-RUN (Preview only)' : 'LIVE (Auto-terminate unprotected)'}`);
-  console.log(`Interval          : ${options.once ? 'Single scan (--once)' : `Every ${options.interval}s (Every-minute bot)`}`);
+  console.log(`Interval          : ${options.once ? 'Single scan (--once)' : `Every ${options.interval}s`}`);
   console.log(`Session Dir       : ${options.userDataDir}`);
 
   console.log('='.repeat(65));
@@ -1262,6 +1293,7 @@ if (require.main === module) {
 module.exports = {
   main,
   isLocationAllowed,
+  isInIndia,
   classifySession,
   performScan,
   parseSessionCookies,

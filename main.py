@@ -22,10 +22,14 @@ import sys
 import urllib.request
 from typing import List, Set, Tuple
 
-# Locations that are ALWAYS protected. --allow only ADDS to this list; nothing
-# can remove an entry. Matching is case-insensitive substring matching, so
-# "Mumbai, Maharashtra, IN" and "Bergen, Vestland, NO" both match.
-PROTECTED_LOCATIONS = ["mumbai", "navi mumbai", "bergen", "panvel"]
+# Only sessions located in India are ever candidates for termination; anything
+# outside India is always kept. Inside India, these cities are ALWAYS protected.
+# --allow only ADDS to this list; nothing can remove an entry. Matching is
+# case-insensitive substring matching, so "Mumbai, Maharashtra, IN" matches.
+PROTECTED_LOCATIONS = ["mumbai", "navi mumbai", "panvel", "thane"]
+
+# Country suffixes Claude may append for India ("Pune, Maharashtra, IN").
+INDIA_COUNTRY_NAMES = ("in", "india")
 
 # Chrome profile used by default (folder name, display name or account email).
 DEFAULT_CHROME_PROFILE = "shreyans.tatiya@gmail.com"
@@ -34,9 +38,18 @@ DEFAULT_CHROME_PROFILE = "shreyans.tatiya@gmail.com"
 SETTINGS_URL = "https://claude.ai/settings/account"
 
 
+def is_in_india(location: str) -> bool:
+    """True only when the last comma-separated part is India AND a city precedes
+    it. Another country, no country or a bare "IN" is never treated as India."""
+    parts = [p.strip().lower() for p in (location or "").split(",") if p.strip()]
+    return len(parts) >= 2 and parts[-1] in INDIA_COUNTRY_NAMES
+
+
 def is_location_allowed(location: str, allowed_locations: List[str]) -> bool:
     if not location:
         return False
+    if not is_in_india(location):
+        return True
     loc_lower = location.lower()
     full_list = list(dict.fromkeys(PROTECTED_LOCATIONS + list(allowed_locations or [])))
     return any(str(allowed).lower() in loc_lower for allowed in full_list)
@@ -59,6 +72,9 @@ def classify_session(device_text: str, location_text: str, is_current: bool,
     # we simply do not know where it is.
     if location in ("", "-", "--"):
         return True, "Location unknown - kept for safety"
+
+    if not is_in_india(location):
+        return True, "Outside India (or country not shown)"
 
     if is_location_allowed(location, allowed_locations):
         return True, "Protected location"
@@ -737,7 +753,7 @@ async def main():
     parser.add_argument("--once", action="store_true", help="Run a single scan and exit")
     parser.add_argument("--dry-run", action="store_true", help="Preview sessions without terminating")
     parser.add_argument("--allow", "-a", type=str, default="",
-                        help="EXTRA protected locations, comma-separated. Added to the "
+                        help="EXTRA protected Indian cities, comma-separated. Added to the "
                              f"always-protected list ({', '.join(PROTECTED_LOCATIONS)}), which cannot be disabled.")
     parser.add_argument("--chrome-path", type=str, default=None,
                         help="Path to chrome.exe (default: auto-detected local install)")
@@ -760,7 +776,7 @@ async def main():
     print("=" * 65)
     print("  Claude Active Sessions Manager - Python Bot")
     print("=" * 65)
-    print(f"Protected (always): {', '.join(PROTECTED_LOCATIONS)}")
+    print(f"Protected (always): outside India, and in India: {', '.join(PROTECTED_LOCATIONS)}")
     if extra_locations:
         print(f"Protected (extra) : {', '.join(extra_locations)}")
     print(f"Mode              : {'DRY-RUN (Preview only)' if args.dry_run else 'LIVE (Auto-terminate unprotected)'}")
