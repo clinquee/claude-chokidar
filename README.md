@@ -102,21 +102,21 @@ table.
 
 ## Requirements
 
-- **Node.js 18+**
-- **Google Chrome** installed locally (the bot drives `chrome.exe`; it does not
-  need Playwright's bundled Chromium)
+- **C++17 Compiler** (`clang++` or `g++`) and `make` (zero external dependencies required)
+- **Google Chrome** (or Chromium) installed locally
 - A Claude account you are signed in to in that Chrome
 
 ---
 
 ## Setup
 
-### 1. Install
+### 1. Build
 
 ```bash
 git clone git@github.com:Amrit-Nigam/claude-chokidar.git
 cd claude-chokidar
-npm install
+make all
+make test
 ```
 
 ### 2. Get your session cookie
@@ -413,11 +413,18 @@ python main.py --interval 300        # every 5 minutes
 
 | File | Purpose |
 |---|---|
-| `index.js` | The bot: scanning, classification, termination, safety guards |
-| `main.py` | Python port of the same bot |
-| `chromeProfile.js` | Finds your local `chrome.exe` and Chrome profiles |
-| `save-session-key.js` | Writes `session-key.txt` with correct encoding |
-| `launch-chrome-debug.js` | Starts your own Chrome with a debug port |
+| `src/main.cpp` | CLI entry point and orchestration |
+| `src/bot.cpp` / `src/bot.hpp` | The bot: scanning, classification, termination, safety guards |
+| `src/cdp.cpp` / `src/cdp.hpp` | Low-latency Chrome DevTools Protocol engine (WebSocket JSON-RPC) |
+| `src/net.cpp` / `src/net.hpp` | Direct POSIX socket HTTP and RFC 6455 WebSocket client |
+| `src/safety.cpp` / `src/safety.hpp` | Location parsing, India detection, and safety classification |
+| `src/config.cpp` / `src/config.hpp` | Argument parsing, `.env` / cookie parsing, precedence resolver |
+| `src/chrome_finder.cpp` / `src/chrome_finder.hpp` | Finds installed Chrome and parses profile metadata |
+| `src/health_server.cpp` / `src/health_server.hpp` | Embedded cloud keep-alive HTTP server on `$PORT` |
+| `src/json.hpp` | Zero-dependency high-speed JSON parser and serializer |
+| `tests/test_main.cpp` | Assert-based test suite verifying safety invariants |
+| `Makefile` / `CMakeLists.txt` | C++ build systems (-O3 -flto) |
+| `Dockerfile` | Multi-stage slim container running native C++ binary |
 | `.env.example` | Template for your `.env` |
 | `chrome_session/` | The bot's browser profile (gitignored) |
 

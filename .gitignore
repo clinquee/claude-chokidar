@@ -7,3 +7,5 @@ session-key.txt
 chrome_profile/
 .env
 .env.local
+build/
+claude-chokidar
