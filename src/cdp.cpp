@@ -141,10 +141,10 @@ bool CdpSession::set_cookies(const std::vector<SessionCookie>& cookies) {
                 params["expires"] = expires;
 
                 JsonValue resp = send_command("Network.setCookie", params);
-                if (resp.contains("result")) {
-                    if (resp["result"]["success"].is_bool() && !resp["result"]["success"].as_bool()) {
-                        all_ok = false;
-                    }
+                if (!resp.contains("result") || resp.contains("error")) {
+                    all_ok = false;
+                } else if (resp["result"]["success"].is_bool() && !resp["result"]["success"].as_bool()) {
+                    all_ok = false;
                 }
             }
         }

@@ -113,6 +113,7 @@ void test_interval_parsing() {
     assert(parse_interval("0") == -1);
     assert(parse_interval("-10") == -1);
     assert(parse_interval("invalid") == -1);
+    assert(parse_interval("999999999999999999") == -1);
     std::cout << "  ✓ Interval parsing passed\n";
 }
 
@@ -131,6 +132,15 @@ void test_cookie_parsing() {
     // Multi-line
     auto c3 = parse_session_cookies("sessionKey=sk-ant-1\nsessionKeyLC=sk-ant-2\n# comment\n");
     assert(c3.size() == 2);
+
+    // UTF-16LE BOM prefix
+    std::string utf16_raw = "\xff\xfe";
+    utf16_raw += "sessionKey=sk-utf16\0";
+    auto c4 = parse_session_cookies(utf16_raw);
+    assert(c4.size() == 1);
+    assert(c4[0].name == "sessionKey");
+    assert(c4[0].value == "sk-utf16");
+
     std::cout << "  ✓ Cookie parsing passed\n";
 }
 
@@ -162,6 +172,12 @@ void test_json_parser() {
     assert(err.empty());
     assert(root2["count"].as_int() == 42);
     assert(root2["status"].as_string() == "ok");
+
+    // Trailing garbage must fail
+    std::string trailing_err;
+    JsonValue bad = JsonValue::parse(R"({"status":"ok"} extra garbage)", &trailing_err);
+    assert(!trailing_err.empty());
+
     std::cout << "  ✓ JSON parser passed\n";
 }
 

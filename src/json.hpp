@@ -205,6 +205,9 @@ public:
         try {
             JsonValue val = parse_val(str, idx);
             skip_ws(str, idx);
+            if (idx != str.size()) {
+                throw std::runtime_error("Unexpected trailing data after JSON value");
+            }
             return val;
         } catch (const std::exception& e) {
             if (err) *err = e.what();

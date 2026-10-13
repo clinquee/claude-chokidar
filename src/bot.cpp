@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <filesystem>
 
 namespace chokidar {
 
@@ -50,8 +51,21 @@ void Bot::cleanup() {
     }
     if (chrome_pid_ > 0 && !is_cdp_attached_) {
         kill(chrome_pid_, SIGTERM);
-        int status;
-        waitpid(chrome_pid_, &status, WNOHANG);
+        int status = 0;
+        int64_t deadline = now_ms() + 1000;
+        bool exited = false;
+        while (now_ms() < deadline) {
+            pid_t p = waitpid(chrome_pid_, &status, WNOHANG);
+            if (p > 0 || (p == -1 && errno == ECHILD)) {
+                exited = true;
+                break;
+            }
+            sleep_ms(50);
+        }
+        if (!exited) {
+            kill(chrome_pid_, SIGKILL);
+            waitpid(chrome_pid_, &status, 0);
+        }
         chrome_pid_ = -1;
     }
 }
@@ -111,8 +125,8 @@ bool Bot::open_browser() {
                   << " (" << profile.dir << ")" << std::endl;
 
         if (options_.clean_session) {
-            std::string rm_cmd = "rm -rf \"" + user_data + "\"";
-            system(rm_cmd.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(user_data, ec);
         }
 
         mkdir(user_data.c_str(), 0755);
@@ -125,6 +139,7 @@ bool Bot::open_browser() {
             chrome_exe,
             "--remote-debugging-port=" + std::to_string(target_port),
             "--user-data-dir=" + user_data,
+            "--profile-directory=" + profile.dir,
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled"
@@ -191,9 +206,6 @@ bool Bot::open_browser() {
                 std::cout << "Found an existing Claude tab: " << url << std::endl;
                 break;
             }
-        }
-        if (ws_url.empty() && tabs.size() > 0) {
-            ws_url = tabs[0]["webSocketDebuggerUrl"].as_string();
         }
     }
 
@@ -330,8 +342,8 @@ ScanResult Bot::perform_scan(int check_number) {
         table_info = cdp_->evaluate(locate_script);
     }
 
-    if (!table_info.is_object()) {
-        std::cerr << "[" << time << "] Could not find the \"Active sessions\" section. Re-checking on next interval.\n";
+    if (!table_info.is_object() || table_info["columns"]["device"].as_int() < 0 || table_info["columns"]["location"].as_int() < 0) {
+        std::cerr << "[" << time << "] Could not find the \"Active sessions\" section or table has unexpected columns. Re-checking on next interval.\n";
         return res;
     }
 
@@ -462,7 +474,7 @@ ScanResult Bot::perform_scan(int check_number) {
                     "    if (!confirmBtn) return {success: false, error: 'Confirm button not found'};\n"
                     "    confirmBtn.click();\n"
                     "    return {success: true};\n"
-                    "})(" + std::to_string(target_row_idx) + ")";
+                    "})(" + target_session.row_id + ")";
 
                 JsonValue term_res = cdp_->evaluate(term_script);
                 if (term_res["success"].as_bool()) {

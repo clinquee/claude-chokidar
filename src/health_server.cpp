@@ -50,6 +50,7 @@ bool HealthServer::start() {
 void HealthServer::stop() {
     if (running_.exchange(false)) {
         if (listen_fd_ >= 0) {
+            shutdown(listen_fd_, SHUT_RDWR);
             close(listen_fd_);
             listen_fd_ = -1;
         }
@@ -72,9 +73,14 @@ void HealthServer::run() {
         int client_fd = accept(listen_fd_, (sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) continue;
 
-        // Drain request (basic)
-        char buf[1024];
-        recv(client_fd, buf, sizeof(buf) - 1, 0);
+        // Drain request with bounded timeout
+        pollfd client_pfd{};
+        client_pfd.fd = client_fd;
+        client_pfd.events = POLLIN;
+        if (poll(&client_pfd, 1, 2000) > 0) {
+            char buf[1024];
+            recv(client_fd, buf, sizeof(buf) - 1, 0);
+        }
 
         int64_t uptime_sec = stats_ ? ((now_ms() - stats_->started_at) / 1000) : 0;
         JsonValue resp = JsonValue::object();

@@ -16,24 +16,34 @@ int parse_interval(const std::string& value) {
     if (!std::regex_match(s, match, re)) {
         return -1;
     }
-    int num = std::stoi(match[1].str());
+    int64_t num = 0;
+    try {
+        num = std::stoll(match[1].str());
+    } catch (...) {
+        return -1;
+    }
     std::string unit = to_lower(match[2].str());
-    int multiplier = 1;
+    int64_t multiplier = 1;
     if (unit == "s" || unit.empty()) multiplier = 1;
     else if (unit == "m") multiplier = 60;
     else if (unit == "h") multiplier = 3600;
 
-    int total = num * multiplier;
-    return total > 0 ? total : -1;
+    int64_t total = num * multiplier;
+    if (total <= 0 || total > 86400 * 365) return -1;
+    return static_cast<int>(total);
 }
 
 std::vector<SessionCookie> parse_session_cookies(const std::string& raw) {
     if (raw.empty()) return {};
 
     std::string text = raw;
-    // Strip UTF-8 BOM if present
+    // Strip UTF-8 or UTF-16 BOM if present
     if (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB && (unsigned char)text[2] == 0xBF) {
         text = text.substr(3);
+    } else if (text.size() >= 2 && ((unsigned char)text[0] == 0xFF && (unsigned char)text[1] == 0xFE)) {
+        text = text.substr(2);
+    } else if (text.size() >= 2 && ((unsigned char)text[0] == 0xFE && (unsigned char)text[1] == 0xFF)) {
+        text = text.substr(2);
     }
     // Strip null bytes
     std::string sanitized;

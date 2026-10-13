@@ -21,12 +21,23 @@ static int set_nonblocking(int fd, bool nonblock) {
 }
 
 static int connect_with_timeout(const std::string& host, int port, int timeout_ms) {
+#if defined(SIGPIPE)
+    static bool sigpipe_ignored = false;
+    if (!sigpipe_ignored) {
+        signal(SIGPIPE, SIG_IGN);
+        sigpipe_ignored = true;
+    }
+#endif
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
     // Enable TCP_NODELAY for ultra-low latency
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+#if defined(SO_NOSIGPIPE)
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (char*)&flag, sizeof(flag));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -354,6 +365,12 @@ bool WebSocketClient::receive_text(std::string& out_text, int timeout_ms) {
             for (int i = 0; i < 8; ++i) {
                 payload_len = (payload_len << 8) | ext[i];
             }
+        }
+
+        // Bounded frame check: reject > 32MB to prevent unbounded allocation
+        if (payload_len > 32 * 1024 * 1024) {
+            close();
+            return false;
         }
 
         uint8_t mask[4] = {0, 0, 0, 0};

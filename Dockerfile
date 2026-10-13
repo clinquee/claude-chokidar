@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
-RUN make clean && make -j$(nproc) all
+RUN make clean && make -j$(nproc) CXX=g++ all
 
 # Runtime stage: slim container with Chromium
 FROM debian:bookworm-slim
