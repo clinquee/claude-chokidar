@@ -32,6 +32,9 @@
  *                          (pause / still paused / alert / back online), not tests
  *   SMTP_HOST, SMTP_PORT   default smtp.gmail.com:465
  *   NTFY_TOPIC             optional ntfy.sh topic for phone pushes
+ *   HEALTHCHECK_URL        optional healthchecks.io ping URL: pinged after every
+ *                          completed scan, /fail on pause. healthchecks.io alerts
+ *                          from outside if the pings stop (VM down, wrapper dead)
  */
 
 const fs = require('fs');
@@ -84,7 +87,8 @@ function config() {
     smtpPort: parseInt(env.SMTP_PORT || '465', 10),
     to: env.NOTIFY_EMAIL || 'shrey00710@gmail.com',
     also: (env.NOTIFY_ALSO || '').split(',').map(a => a.trim()).filter(Boolean),
-    ntfyTopic: env.NTFY_TOPIC
+    ntfyTopic: env.NTFY_TOPIC,
+    healthcheckUrl: env.HEALTHCHECK_URL
   };
 }
 
@@ -126,6 +130,21 @@ function sendEmail(subject, body, recipients) {
     to: recipients.join(', '),
     subject: `[chokidar] ${subject}`,
     text: body
+  });
+}
+
+// Dead-man's switch ping. suffix '' = success, '/fail' = failure.
+function pingHealthcheck(suffix = '', message = '') {
+  const { healthcheckUrl } = config();
+  if (!healthcheckUrl) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const req = https.request(healthcheckUrl.replace(/\/+$/, '') + suffix, { method: 'POST', timeout: 10000 }, res => {
+      res.resume();
+      res.statusCode < 300 ? resolve() : reject(new Error(`healthcheck HTTP ${res.statusCode}`));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('healthcheck timeout')));
+    req.end(redact(message).slice(0, 10000));
   });
 }
 
@@ -268,6 +287,7 @@ function onLine(line) {
   } else if (line.includes('Check complete.')) {
     lastProgress = Date.now();
     failedScans = 0;
+    pingHealthcheck('', line).catch(err => log(`Healthcheck ping failed: ${err.message}`));
   } else if (/Could not find the "Active sessions"|Could not identify the Active sessions table|unexpected columns|Scan error:/.test(line)) {
     lastProgress = Date.now();
     failedScans++;
@@ -335,6 +355,8 @@ function pause(reason, details) {
   if (child) killBot(`pausing (${reason})`);
   paused = { reason, details, since: new Date().toISOString(), keyHash: keyHash(), lastEmailAt: Date.now() };
   writeState(paused);
+  pingHealthcheck('/fail', `PAUSED: ${reason}
+${details}`).catch(err => log(`Healthcheck fail ping failed: ${err.message}`));
   notify(`PAUSED - ${reason}`, `${details}\n\nThe watchdog is PAUSED: your Claude sessions are NOT being protected until this is fixed.`);
 }
 
@@ -393,6 +415,7 @@ async function main() {
     process.exit(ok ? 0 : 1);
   }
   if (args[0] === '--alert') {
+    await pingHealthcheck('/fail', args.slice(1).join(' ')).catch(() => {});
     const ok = await notify('ALERT', args.slice(1).join(' ') || 'claude-chokidar needs attention.', { includeLog: false });
     process.exit(ok ? 0 : 1);
   }

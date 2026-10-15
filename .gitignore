@@ -8,3 +8,7 @@ chrome_profile/
 .env
 .env.local
 .chokidar-paused.json
+
+# Lightsail SSH key + copy-paste commands (local only)
+vm-access/
+*.pem
