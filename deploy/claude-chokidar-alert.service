@@ -1,0 +1,8 @@
+[Unit]
+Description=Email alert when claude-chokidar.service fails
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/claude-chokidar
+ExecStart=/usr/bin/node notify-wrapper.js --alert "systemd gave up restarting claude-chokidar.service (it failed 5 times in 10 minutes). Check: journalctl -u claude-chokidar -n 200"

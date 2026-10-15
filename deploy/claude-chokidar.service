@@ -1,0 +1,24 @@
+[Unit]
+Description=Claude Chokidar - active-session watchdog (bot:1m:headless) with expiry notifier
+After=network-online.target
+Wants=network-online.target
+# If systemd itself gives up restarting the wrapper, still send an email.
+OnFailure=claude-chokidar-alert.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/claude-chokidar
+ExecStart=/usr/bin/node notify-wrapper.js
+Restart=always
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=40
+# Shared box: keep chokidar from starving relaxport, and make it the OOM victim.
+MemoryHigh=900M
+MemoryMax=1100M
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

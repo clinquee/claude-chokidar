@@ -23,6 +23,7 @@ add another device to your session list.
 - [Running the bot](#running-the-bot)
   - [Scan intervals](#scan-intervals)
   - [Running in the background](#running-in-the-background)
+  - [Always-on server with expiry alerts](#always-on-server-with-expiry-alerts)
 - [All command-line options](#all-command-line-options)
 - [How sign-in works](#how-sign-in-works)
 - [Troubleshooting](#troubleshooting)
@@ -293,6 +294,36 @@ pm2 logs claude-chokidar
 pm2 save && pm2 startup     # survive reboots
 ```
 
+### Always-on server with expiry alerts
+
+On a Linux server, run the bot under `notify-wrapper.js` via systemd instead
+of pm2. The wrapper runs `npm run bot:1m:headless`, and when something goes
+wrong it **pauses the bot and emails you**:
+
+| Problem | What the wrapper does |
+|---|---|
+| Session key expired / rejected | retries once, then pauses + emails |
+| Logged out mid-run ("Log out of all devices", revoked key) | retries once, then pauses + emails |
+| Crash loop (4 failures in 30 min) | pauses + emails |
+| Hung (no scan for 10 min) or 5 unreadable scans in a row | restarts; counts toward the crash loop |
+| systemd gives up restarting the wrapper | `claude-chokidar-alert.service` emails |
+
+While paused, a reminder goes out every 24h. Saving a new key
+(`npm run session-key -- <value>`) resumes it automatically within ~15s and
+sends a "back online" email; `npm run chokidar:resume` clears any other pause.
+
+Setup (Ubuntu, Node 20, Google Chrome installed):
+
+```bash
+cd ~/claude-chokidar && npm ci --omit=dev
+# .env: SMTP_USER / SMTP_PASS (Gmail app password), NOTIFY_EMAIL, NOTIFY_ALSO - see .env.example
+npm run session-key -- "<sessionKey value>"
+npm run notify:test                       # confirm the email arrives
+sudo cp deploy/*.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now claude-chokidar
+journalctl -u claude-chokidar -f
+```
+
 ---
 
 ## All command-line options
@@ -418,6 +449,8 @@ python main.py --interval 300        # every 5 minutes
 | `chromeProfile.js` | Finds your local `chrome.exe` and Chrome profiles |
 | `save-session-key.js` | Writes `session-key.txt` with correct encoding |
 | `launch-chrome-debug.js` | Starts your own Chrome with a debug port |
+| `notify-wrapper.js` | Always-on supervisor: emails and pauses on expiry, logout, crashes |
+| `deploy/*.service` | systemd units for the supervisor and its failure alert |
 | `.env.example` | Template for your `.env` |
 | `chrome_session/` | The bot's browser profile (gitignored) |
 

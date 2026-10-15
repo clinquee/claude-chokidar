@@ -7,3 +7,4 @@ session-key.txt
 chrome_profile/
 .env
 .env.local
+.chokidar-paused.json

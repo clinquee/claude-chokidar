@@ -179,6 +179,10 @@ Examples:
 // Claude's account settings page, where the active-session table lives.
 const SETTINGS_URL = 'https://claude.ai/settings/account';
 
+// Exit codes read by notify-wrapper.js. 1 is any other fatal error.
+const EXIT_AUTH_FAILED = 2; // could not sign in at startup (session key expired/rejected)
+const EXIT_LOGGED_OUT = 3;  // was signed in, then claude.ai logged this session out
+
 // Strict signed-in probe: the login page must not be showing AND the account
 // page content must actually be present. A loose check here previously made the
 // bot believe a signed-out profile was authenticated.
@@ -512,6 +516,12 @@ async function performScan(page, options, checkNumber) {
   try {
     await page.waitForSelector('text=Active sessions', { timeout: 15000 });
   } catch (err) {
+    // claude.ai bounces a revoked session to the login flow, so an account page
+    // that lands there means this session was logged out mid-run.
+    if (/\/(login|logout|magic-link)/.test(page.url())) {
+      console.error(`[${time}] Signed out: claude.ai redirected the account page to ${page.url()}.`);
+      return { scanned: 0, kept: 0, terminated: 0, authLost: true };
+    }
     console.error(`[${time}] Could not find the "Active sessions" section. Re-checking on next interval.`);
     return { scanned: 0, kept: 0, terminated: 0 };
   }
@@ -1120,8 +1130,9 @@ async function main() {
     });
   }
 
-  // Graceful shutdown handler
-  async function cleanup() {
+  // Graceful shutdown handler. The exit code tells notify-wrapper.js why the
+  // bot stopped (see EXIT_* above).
+  async function cleanup(exitCode = 0) {
     if (isShuttingDown) return;
     isShuttingDown = true;
     if (cloudServer) {
@@ -1138,12 +1149,13 @@ async function main() {
         await browser.close().catch(() => {});
       }
     } catch (e) {}
-    console.log('Bot shutdown cleanly. Bye!');
-    process.exit(0);
+    console.log(exitCode === 0 ? 'Bot shutdown cleanly. Bye!' : `Bot stopped (exit code ${exitCode}).`);
+    process.exit(exitCode);
   }
 
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
+  process.on('SIGINT', () => cleanup(0));
+  process.on('SIGTERM', () => cleanup(0));
+  let exitCode = 0;
 
   try {
     // 1. Open the browser (attach to your Chrome, or launch your chrome.exe)
@@ -1206,7 +1218,9 @@ async function main() {
     }
 
     if (!loggedIn) {
-      throw new Error('Not signed in to Claude (timed out waiting). Sign in once in the bot window, or provide a session key, then restart.');
+      throw Object.assign(
+        new Error('Not signed in to Claude (timed out waiting). Sign in once in the bot window, or provide a session key, then restart.'),
+        { exitCode: EXIT_AUTH_FAILED });
     }
 
     // Anchor timing and make "Log out of all devices" unclickable in this window.
@@ -1224,7 +1238,12 @@ async function main() {
         stats.scans++;
         stats.terminated += result.terminated;
         stats.kept += result.kept;
+        if (result.authLost) {
+          throw Object.assign(new Error('Signed out of claude.ai mid-run (session revoked or expired).'),
+            { exitCode: EXIT_LOGGED_OUT });
+        }
       } catch (scanErr) {
+        if (scanErr.exitCode) throw scanErr;
         console.error(`[${getTimestamp()}] Scan error: ${scanErr.message}. Will retry on next interval.`);
         if (scanErr.message && scanErr.message.includes('crash') && !isCdp) {
           console.log(`[${getTimestamp()}] Detected page/target crash. Recovering browser session...`);
@@ -1276,9 +1295,10 @@ async function main() {
     if (!isShuttingDown) {
       console.error('\n[Error occurred during bot execution]:', error.message);
     }
+    exitCode = error.exitCode || 1;
   } finally {
     if (!isShuttingDown) {
-      await cleanup();
+      await cleanup(exitCode);
     }
   }
 }

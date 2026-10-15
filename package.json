@@ -138,7 +138,10 @@
     "profiles": "node index.js --list-profiles",
     "chrome:debug": "node launch-chrome-debug.js",
     "connect": "node index.js --cdp 9222",
-    "test": "node -e \"require('./index.js'); console.log('Syntax OK')\""
+    "test": "node -e \"require('./index.js'); console.log('Syntax OK')\"",
+    "supervise": "node notify-wrapper.js",
+    "notify:test": "node notify-wrapper.js --test",
+    "chokidar:resume": "node notify-wrapper.js --resume"
   },
   "keywords": [
     "claude",
@@ -150,6 +153,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "nodemailer": "^7.0.13",
     "playwright": "^1.63.0"
   }
 }
