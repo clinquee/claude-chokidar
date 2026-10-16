@@ -54,6 +54,8 @@ const AUTH_RETRY_DELAY_MS = 60 * 1000;
 const CRASH_WINDOW_MS = 30 * 60 * 1000;
 const MAX_CRASHES = 4;                     // within CRASH_WINDOW_MS, then pause
 const MAX_FAILED_SCANS = 5;                // consecutive unreadable scans, then restart
+const TERM_FAIL_ALERT_SCANS = 3;           // scans in a row an unauthorized session survives, then email
+const TERM_FAIL_REPEAT_SCANS = 60;         // keep reminding about every ~hour while it persists
 const STALL_MS = 10 * 60 * 1000;           // no progress for this long = hung
 const STARTUP_STALL_MS = 5 * 60 * 1000;    // never reached "Authentication confirmed"
 const REMINDER_MS = 24 * 60 * 60 * 1000;
@@ -231,6 +233,9 @@ let paused = null;           // current pause state, or null
 let authFailures = 0;
 let crashes = [];            // timestamps
 let failedScans = 0;
+let termFailedThisScan = false; // a termination attempt failed during the current scan
+let termFailScans = 0;          // consecutive scans that ended with a failed termination
+let lastTermFailLine = '';
 let healthy = false;         // reached "Authentication confirmed" this run
 let startedAt = 0;
 let lastProgress = 0;
@@ -282,11 +287,16 @@ function onLine(line) {
       announceRecovery = false;
       notify('Back online', 'The bot signed in to claude.ai again and is watching your sessions.', { includeLog: false });
     }
+  } else if (/\[TERMINATING\]/.test(line)) {
+    lastTermFailLine = line.trim();
+  } else if (/Error terminating session|Could not confirm in the dialog|Session still listed after confirming/.test(line)) {
+    termFailedThisScan = true;
   } else if (/Check #\d+|Browser recycled|Session recovered/.test(line)) {
     lastProgress = Date.now();
   } else if (line.includes('Check complete.')) {
     lastProgress = Date.now();
     failedScans = 0;
+    trackTerminationFailures();
     pingHealthcheck('', line).catch(err => log(`Healthcheck ping failed: ${err.message}`));
   } else if (/Could not find the "Active sessions"|Could not identify the Active sessions table|unexpected columns|Scan error:/.test(line)) {
     lastProgress = Date.now();
@@ -295,6 +305,27 @@ function onLine(line) {
       killBot(`${failedScans} scans in a row could not read the Active sessions table`);
     }
   }
+}
+
+// An unauthorized session the bot keeps failing to end is exactly what this
+// watchdog exists for, so it must not fail silently.
+function trackTerminationFailures() {
+  if (termFailedThisScan) {
+    termFailScans++;
+    if (termFailScans === TERM_FAIL_ALERT_SCANS ||
+        (termFailScans > TERM_FAIL_ALERT_SCANS && (termFailScans - TERM_FAIL_ALERT_SCANS) % TERM_FAIL_REPEAT_SCANS === 0)) {
+      notify('ALERT: could not terminate an unauthorized session',
+        `The bot found a session it should end but has failed to terminate it ${termFailScans} scans in a row.\n` +
+        `${lastTermFailLine}\n\nEnd it by hand now: claude.ai > Settings > Account > Active sessions.`);
+    }
+  } else if (termFailScans >= TERM_FAIL_ALERT_SCANS) {
+    notify('Resolved: unauthorized session is gone',
+      `After ${termFailScans} failed scans the session is no longer blocking termination.\n${lastTermFailLine}`);
+    termFailScans = 0;
+  } else {
+    termFailScans = 0;
+  }
+  termFailedThisScan = false;
 }
 
 function killBot(reason) {

@@ -338,13 +338,13 @@ async function installLogoutGuard(page) {
 }
 
 // Click only after checking the element is not a "log out of all devices" control.
-async function safeClick(locator, what = 'element') {
+async function safeClick(locator, what = 'element', clickOptions = {}) {
   const label = ((await locator.innerText().catch(() => '')) + ' ' +
                  (await locator.getAttribute('aria-label').catch(() => '') || '')).trim();
   if (FORBIDDEN_CLICK_TEXT.test(label)) {
     throw new Error(`Refused to click ${what}: its label ("${label}") would log out all devices.`);
   }
-  await locator.click();
+  await locator.click(clickOptions);
 }
 
 /**
@@ -382,6 +382,37 @@ async function confirmTermination(page, timeoutMs = 8000) {
 
   await safeClick(button, 'the confirm button');
   return true;
+}
+
+// claude.ai's cookie consent banner sits in the bottom-right corner, right over
+// the session table's action buttons, and swallows clicks on them. A fresh
+// headless profile never answers it. Clicking its buttons would land outside the
+// settings modal (and could close it), so just hide it in this page.
+async function dismissCookieBanner(page) {
+  await page.evaluate(() => {
+    const reject = [...document.querySelectorAll('button')]
+      .find(b => /^\s*reject all cookies\s*$/i.test(b.innerText || ''));
+    if (!reject) return;
+    let banner = reject;
+    while (banner.parentElement && banner.parentElement !== document.body &&
+           !/we use cookies/i.test(banner.innerText || '')) {
+      banner = banner.parentElement;
+    }
+    banner.style.setProperty('display', 'none', 'important');
+  }).catch(() => {});
+}
+
+// Click a control even when an overlay covers it: try a normal click first,
+// then fall back to keyboard activation, which ignores whatever is on top.
+async function clickOrActivate(locator, what) {
+  try {
+    await safeClick(locator, what, { timeout: 8000 });
+  } catch (err) {
+    if (/Refused to click/.test(err.message)) throw err;
+    console.warn(`  --> Click on ${what} was blocked (${err.message.split('\n')[0]}); using the keyboard instead.`);
+    await locator.focus();
+    await locator.press('Enter');
+  }
 }
 
 // Close a dialog that was opened but must not be acted on.
@@ -502,6 +533,7 @@ async function performScan(page, options, checkNumber) {
 
   // Re-arm the guard after navigation.
   await installLogoutGuard(page);
+  await dismissCookieBanner(page);
 
   // Ensure "Active sessions" is visible (give Claude's React app a moment to hydrate)
   let activeSessionsHeader = page.locator('text=Active sessions');
@@ -637,7 +669,8 @@ async function performScan(page, options, checkNumber) {
         try {
           const actionBtn = rowToTerminate.locator('button[aria-label^="Session actions"], button[aria-haspopup="menu"], button').first();
           await actionBtn.scrollIntoViewIfNeeded();
-          await safeClick(actionBtn, 'the row action button');
+          await dismissCookieBanner(page);
+          await clickOrActivate(actionBtn, 'the row action button');
           await page.waitForTimeout(500);
 
           // Playwright rejects a selector list that mixes CSS with a `text=`
@@ -653,7 +686,7 @@ async function performScan(page, options, checkNumber) {
           if (!terminateItem) {
             throw new Error('No "Terminate" menu item appeared.');
           }
-          await safeClick(terminateItem, 'the Terminate menu item');
+          await clickOrActivate(terminateItem, 'the Terminate menu item');
           await page.waitForTimeout(500);
 
           // Claude asks "Terminate session - are you sure?" before acting.
