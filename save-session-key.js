@@ -41,6 +41,12 @@ function save(raw) {
     process.exit(1);
   }
 
+  // Overwriting the key with a typo silently kills the bot, so refuse it here.
+  if (!cookies.some(c => c.value.startsWith('sk-ant-'))) {
+    console.error('That does not look like a claude.ai session cookie (no value starts with "sk-ant-"). Nothing written.');
+    process.exit(1);
+  }
+
   const body = [
     '# claude.ai session cookies - treat this file like a password.',
     '# Regenerate with: node save-session-key.js "<paste cookie value>"',
@@ -55,10 +61,6 @@ function save(raw) {
   console.log(`Saved ${cookies.length} cookie(s) to ${OUT_FILE}:`);
   for (const c of cookies) {
     console.log(`  ${c.name} (${c.value.length} chars)`);
-  }
-  if (!cookies.some(c => c.value.startsWith('sk-ant-sid'))) {
-    console.log('\nNote: claude.ai session values normally start with "sk-ant-sid".');
-    console.log('If sign-in fails, re-copy the cookie value.');
   }
   console.log('\nThis file is gitignored. Now run:  npm start');
 }

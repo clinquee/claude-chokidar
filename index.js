@@ -28,6 +28,10 @@ const PROTECTED_LOCATIONS = ['mumbai', 'navi mumbai', 'panvel', 'thane'];
 // Country suffixes Claude may append for India ("Pune, Maharashtra, IN").
 const INDIA_COUNTRY_NAMES = ['in', 'india'];
 
+// Claude Code logins are listed with the browser sessions, as "Claude Code" with
+// location "Unknown". They are never terminated, wherever they appear to be.
+const PROTECTED_DEVICES = /claude\s*code/i;
+
 // Chrome profile used by default (matched against profile dir, display name or
 // account email in Chrome's "Local State").
 const DEFAULT_CHROME_PROFILE = 'shreyans.tatiya@gmail.com';
@@ -177,7 +181,22 @@ Examples:
 }
 
 // Claude's account settings page, where the active-session table lives.
-const SETTINGS_URL = 'https://claude.ai/settings/account';
+const SETTINGS_URL = 'https://claude.ai/new#settings/account';
+
+// The session list's heading: "Where you're logged in" today, "Active sessions"
+// before the settings redesign. `.` stands in for the curly apostrophe.
+const SESSIONS_HEADING_SOURCE = 'active sessions|where you.re logged in';
+const SESSIONS_HEADING_SELECTOR = `text=/${SESSIONS_HEADING_SOURCE}/i`;
+
+// Settings is a modal on a hash URL, so a goto to the URL we are already on is a
+// same-document navigation that leaves the old rows on screen. Reload instead.
+async function openSettings(page, timeout = 30000) {
+  if (page.url() === SETTINGS_URL) {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout });
+  } else {
+    await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout });
+  }
+}
 
 // Exit codes read by notify-wrapper.js. 1 is any other fatal error.
 const EXIT_AUTH_FAILED = 2; // could not sign in at startup (session key expired/rejected)
@@ -192,7 +211,7 @@ async function isSignedIn(page) {
   if ((await page.title().catch(() => '')).includes('Just a moment')) return false;
 
   const markers = [
-    'text=Active sessions',
+    SESSIONS_HEADING_SELECTOR,
     'text=Log out of all devices',
     '[data-testid="user-menu-button"]'
   ];
@@ -244,6 +263,10 @@ function classifySession({ deviceText, locationText, isCurrent }, allowedLocatio
   // rendered for whichever session requested the page, which is this browser.
   if (isCurrent) {
     return { keep: true, reason: 'Current session' };
+  }
+
+  if (PROTECTED_DEVICES.test(deviceText || '')) {
+    return { keep: true, reason: 'Claude Code login' };
   }
 
   const location = (locationText || '').replace(/\s+/g, ' ').trim();
@@ -433,14 +456,14 @@ const SESSIONS_TABLE = 'table[data-chokidar-sessions="1"]';
  * in which case the caller must do nothing this round.
  */
 async function locateSessionsTable(page) {
-  return page.evaluate(() => {
+  return page.evaluate(headingSource => {
     const txt = el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
 
     document.querySelectorAll('[data-chokidar-sessions]')
       .forEach(el => el.removeAttribute('data-chokidar-sessions'));
 
     const heading = [...document.querySelectorAll('h1, h2, h3, h4, h5, h6')]
-      .find(el => /^active sessions$/i.test(txt(el)));
+      .find(el => new RegExp(`^(${headingSource})$`, 'i').test(txt(el)));
     if (!heading) return null;
 
     // Prefer the table inside the heading's own section; fall back to the first
@@ -461,12 +484,12 @@ async function locateSessionsTable(page) {
     const columns = {
       device: indexOf('device'),
       location: indexOf('location'),
-      created: indexOf('created')
+      created: indexOf('(created|signed in)')
     };
 
     table.setAttribute('data-chokidar-sessions', '1');
     return { headers, columns, hasThead: !!table.querySelector('thead') };
-  });
+  }, SESSIONS_HEADING_SOURCE);
 }
 
 // Rows of the Active sessions table only (never the header row).
@@ -519,14 +542,13 @@ async function rereadRow(row, columns) {
 
 // Perform a single scan and termination pass
 async function performScan(page, options, checkNumber) {
-  const settingsUrl = SETTINGS_URL;
   const time = getTimestamp();
 
   console.log(`\n[${time}] Check #${checkNumber}: Inspecting active sessions...`);
 
   // Ensure settings account page is loaded and fresh
   try {
-    await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await openSettings(page);
   } catch (e) {
     console.warn(`[${time}] Navigation warning: ${e.message}`);
   }
@@ -536,17 +558,17 @@ async function performScan(page, options, checkNumber) {
   await dismissCookieBanner(page);
 
   // Ensure "Active sessions" is visible (give Claude's React app a moment to hydrate)
-  let activeSessionsHeader = page.locator('text=Active sessions');
+  let activeSessionsHeader = page.locator(SESSIONS_HEADING_SELECTOR).first();
   if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
     await page.waitForTimeout(2000);
     if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
-      await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await openSettings(page);
       await page.waitForTimeout(3000);
     }
   }
 
   try {
-    await page.waitForSelector('text=Active sessions', { timeout: 15000 });
+    await page.waitForSelector(SESSIONS_HEADING_SELECTOR, { timeout: 15000 });
   } catch (err) {
     // claude.ai bounces a revoked session to the login flow, so an account page
     // that lands there means this session was logged out mid-run.
@@ -1244,7 +1266,7 @@ async function main() {
         await page.waitForURL(url => !url.toString().includes('/login'), {
           timeout: Math.max(5000, maxWaitTime - (Date.now() - startTime))
         }).catch(() => {});
-        await page.goto(settingsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        await openSettings(page, 45000).catch(() => {});
       }
 
       await page.waitForTimeout(2000);
