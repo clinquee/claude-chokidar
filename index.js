@@ -190,7 +190,9 @@ const SESSIONS_HEADING_SELECTOR = `text=/${SESSIONS_HEADING_SOURCE}/i`;
 
 // Settings is a modal on a hash URL, so a goto to the URL we are already on is a
 // same-document navigation that leaves the old rows on screen. Reload instead.
-async function openSettings(page, timeout = 30000) {
+// 60s: claude.ai regularly takes over 30s to reach DOMContentLoaded on the 2-vCPU
+// VM, and each such timeout used to cost a whole scan.
+async function openSettings(page, timeout = 60000) {
   if (page.url() === SETTINGS_URL) {
     await page.reload({ waitUntil: 'domcontentloaded', timeout });
   } else {
@@ -562,13 +564,15 @@ async function performScan(page, options, checkNumber) {
   if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
     await page.waitForTimeout(2000);
     if (!(await activeSessionsHeader.isVisible().catch(() => false))) {
-      await openSettings(page);
+      // A slow reload is not fatal: the page often finishes loading while the
+      // heading wait below runs.
+      await openSettings(page).catch(e => console.warn(`[${time}] Navigation warning: ${e.message}`));
       await page.waitForTimeout(3000);
     }
   }
 
   try {
-    await page.waitForSelector(SESSIONS_HEADING_SELECTOR, { timeout: 15000 });
+    await page.waitForSelector(SESSIONS_HEADING_SELECTOR, { timeout: 30000 });
   } catch (err) {
     // claude.ai bounces a revoked session to the login flow, so an account page
     // that lands there means this session was logged out mid-run.
@@ -1047,12 +1051,20 @@ async function openBrowser(options) {
         if (fs.existsSync(p)) fs.unlinkSync(p);
       } catch (e) {}
     });
+    // The bot profile only needs its cookies. Left alone, Chrome's HTTP and code
+    // caches grew to 1.7GB on the VM, which slows every page load on a small box.
+    for (const dir of ['Cache', 'Code Cache']) {
+      try {
+        fs.rmSync(path.join(options.userDataDir, 'Default', dir), { recursive: true, force: true });
+      } catch (e) {}
+    }
   }
 
   const launchOptions = {
     headless: options.headless,
     viewport: { width: 1280, height: 850 },
     args: [
+      '--disk-cache-size=104857600', // 100MB cap; see the cache cleanup above
       '--disable-blink-features=AutomationControlled',
       '--no-default-browser-check',
       '--no-first-run'
@@ -1228,7 +1240,7 @@ async function main() {
     console.log('Checking authentication status...');
     let loggedIn = false;
     let promptedForLogin = false;
-    const maxWaitTime = (options.headless || process.env.CI) ? 30000 : 300000;
+    const maxWaitTime = (options.headless || process.env.CI) ? 90000 : 300000;
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitTime && !isShuttingDown) {
@@ -1311,7 +1323,7 @@ async function main() {
             browser = reopened.browser;
             context = reopened.context;
             page = reopened.page;
-            await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
             await installLogoutGuard(page);
             console.log(`[${getTimestamp()}] Session recovered successfully.`);
           } catch (recErr) {
@@ -1337,7 +1349,7 @@ async function main() {
         browser = reopened.browser;
         context = reopened.context;
         page = reopened.page;
-        await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        await page.goto(SETTINGS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
         await installLogoutGuard(page);
         console.log(`[${getTimestamp()}] Browser recycled successfully.`);
       }

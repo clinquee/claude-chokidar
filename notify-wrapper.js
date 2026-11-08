@@ -12,7 +12,10 @@
  *   - hung: no scan progress for 10 minutes
  *   - scans keep failing: 5 in a row could not read the Active sessions table
  *
- * Auth failures get one retry first, so a single Cloudflare hiccup does not page you.
+ * Auth failures are retried for ~20 minutes first (1, 3, 5, 10 min apart), because
+ * claude.ai sometimes shows its login page for a few minutes while the key is fine.
+ * While paused for an auth reason the bot still re-checks the key every 15 minutes
+ * and resumes by itself if claude.ai accepts it again.
  *
  * While paused, the bot stays stopped and a reminder goes out every 24h. It
  * resumes by itself when session-key.txt or .env changes (i.e. after
@@ -32,9 +35,11 @@
  *                          (pause / still paused / alert / back online), not tests
  *   SMTP_HOST, SMTP_PORT   default smtp.gmail.com:465
  *   NTFY_TOPIC             optional ntfy.sh topic for phone pushes
- *   HEALTHCHECK_URL        optional healthchecks.io ping URL: pinged after every
- *                          completed scan, /fail on pause. healthchecks.io alerts
- *                          from outside if the pings stop (VM down, wrapper dead)
+ *   HEALTHCHECK_URL        optional healthchecks.io ping URL: pinged every minute
+ *                          while the watchdog is working (a scan completed in the
+ *                          last 30 min, not paused), /fail on pause. healthchecks.io
+ *                          alerts from outside if the pings stop (VM down, wrapper
+ *                          dead, scans broken for 30+ min)
  */
 
 const fs = require('fs');
@@ -49,8 +54,11 @@ const STATE_FILE = path.join(DIR, '.chokidar-paused.json');
 const KEY_FILES = [path.join(DIR, 'session-key.txt'), path.join(DIR, '.env')];
 const BOT_SCRIPT = 'bot:1m:headless';
 
-const AUTH_RETRIES = 1;                    // auth failures tolerated before pausing
-const AUTH_RETRY_DELAY_MS = 60 * 1000;
+// Auth failures are retried at these delays, then the bot pauses and emails.
+const AUTH_RETRY_DELAYS_MS = [1, 3, 5, 10].map(m => m * 60 * 1000);
+const AUTH_PROBE_MS = 15 * 60 * 1000;      // while paused for auth, re-check the key this often
+const HEARTBEAT_MS = 60 * 1000;            // healthchecks.io ping interval
+const HEARTBEAT_MAX_SCAN_AGE_MS = 30 * 60 * 1000; // no completed scan for this long = stop pinging
 const CRASH_WINDOW_MS = 30 * 60 * 1000;
 const MAX_CRASHES = 4;                     // within CRASH_WINDOW_MS, then pause
 const MAX_FAILED_SCANS = 5;                // consecutive unreadable scans, then restart
@@ -242,9 +250,12 @@ let lastProgress = 0;
 let announceRecovery = false; // send "back online" on the next healthy start
 let restartTimer = null;
 let killReason = null;       // why we killed the child, if we did
+let lastScanOkAt = Date.now(); // last "Check complete." (wrapper start counts as one)
+let lastAuthProbeAt = 0;
+let probing = false;         // running a quiet key re-check while paused
 
 function startBot() {
-  if (child || paused || shuttingDown) return;
+  if (child || shuttingDown || (paused && !probing)) return;
   restartTimer = null;
   healthy = false;
   failedScans = 0;
@@ -283,6 +294,10 @@ function onLine(line) {
     healthy = true;
     authFailures = 0;
     lastProgress = Date.now();
+    if (probing) {
+      probing = false;
+      resume('claude.ai accepted the session key again');
+    }
     if (announceRecovery) {
       announceRecovery = false;
       notify('Back online', 'The bot signed in to claude.ai again and is watching your sessions.', { includeLog: false });
@@ -294,10 +309,9 @@ function onLine(line) {
   } else if (/Check #\d+|Browser recycled|Session recovered/.test(line)) {
     lastProgress = Date.now();
   } else if (line.includes('Check complete.')) {
-    lastProgress = Date.now();
+    lastProgress = lastScanOkAt = Date.now();
     failedScans = 0;
     trackTerminationFailures();
-    pingHealthcheck('', line).catch(err => log(`Healthcheck ping failed: ${err.message}`));
   } else if (/Could not find the "Active sessions"|Could not identify the Active sessions table|unexpected columns|Scan error:/.test(line)) {
     lastProgress = Date.now();
     failedScans++;
@@ -345,18 +359,29 @@ function onExit(code, signal) {
   child = null;
   log(`Bot exited (code ${code}, signal ${signal}) after ${Math.round(ranMs / 1000)}s.`);
 
+  if (probing) {
+    probing = false;
+    log(`Key re-check did not sign in; still paused, next re-check in ${AUTH_PROBE_MS / 60000} min.`);
+    return;
+  }
   if (shuttingDown || paused) return;
 
   if (code === 2 || code === 3) {
     authFailures++;
-    const why = code === 2
-      ? 'claude.ai rejected the session key at sign-in - it has most likely expired or been revoked.'
-      : 'The bot was signed in, then claude.ai logged this session out (someone used "Log out of all devices", or the key was revoked/expired).';
-    if (authFailures > AUTH_RETRIES) {
-      pause(code === 2 ? 'Session key expired or rejected' : 'Logged out of claude.ai', why);
+    const why = (code === 2
+      ? 'claude.ai showed its sign-in page instead of the account page.'
+      : 'The bot was signed in, then claude.ai sent it to the sign-in page.') +
+      ` This kept happening for about ${Math.round(AUTH_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) / 60000)} minutes.` +
+      ' Either the session key was revoked/expired (someone used "Log out of all devices" or ended this session),' +
+      ' or claude.ai is having a longer outage.\n\n' +
+      `The bot re-checks the key every ${AUTH_PROBE_MS / 60000} minutes and resumes by itself if it works again.` +
+      ' If it is still paused after that, refresh the key: npm run session-key -- "<sk-ant-sid02-...>"';
+    if (authFailures > AUTH_RETRY_DELAYS_MS.length) {
+      pause(code === 2 ? 'Session key not accepted' : 'Logged out of claude.ai', why);
     } else {
-      log(`Auth problem (${why}) - retrying once in ${AUTH_RETRY_DELAY_MS / 1000}s before alerting.`);
-      scheduleStart(AUTH_RETRY_DELAY_MS);
+      const delay = AUTH_RETRY_DELAYS_MS[authFailures - 1];
+      log(`Auth problem (exit code ${code}) - retry ${authFailures}/${AUTH_RETRY_DELAYS_MS.length} in ${delay / 60000} min before alerting.`);
+      scheduleStart(delay);
     }
     return;
   }
@@ -385,6 +410,7 @@ function pause(reason, details) {
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   if (child) killBot(`pausing (${reason})`);
   paused = { reason, details, since: new Date().toISOString(), keyHash: keyHash(), lastEmailAt: Date.now() };
+  lastAuthProbeAt = Date.now();
   writeState(paused);
   pingHealthcheck('/fail', `PAUSED: ${reason}
 ${details}`).catch(err => log(`Healthcheck fail ping failed: ${err.message}`));
@@ -393,12 +419,30 @@ ${details}`).catch(err => log(`Healthcheck fail ping failed: ${err.message}`));
 
 function resume(why) {
   log(`Resuming: ${why}`);
+  const alreadyRunning = !!child && healthy; // a key re-check that just signed in keeps running
   paused = null;
   clearState();
   authFailures = 0;
   crashes = [];
-  announceRecovery = true;
-  startBot();
+  lastScanOkAt = Date.now();
+  if (alreadyRunning) {
+    notify('Back online', 'The bot signed in to claude.ai again and is watching your sessions.', { includeLog: false });
+  } else {
+    announceRecovery = true;
+    startBot();
+  }
+}
+
+// Paused because claude.ai would not accept the key? The key is often fine and
+// claude.ai was just having a bad few minutes, so quietly try again now and then.
+function isAuthPause(p) {
+  return p && /session key|logged out/i.test(p.reason);
+}
+
+function heartbeat() {
+  if (shuttingDown || paused) return;
+  if (Date.now() - lastScanOkAt > HEARTBEAT_MAX_SCAN_AGE_MS) return; // let healthchecks.io go down
+  pingHealthcheck('', 'ok').catch(err => log(`Healthcheck ping failed: ${err.message}`));
 }
 
 // Runs every 15s: watchdog for hangs, and resume / reminder checks while paused.
@@ -407,7 +451,21 @@ function tick() {
 
   if (paused) {
     if (!fs.existsSync(STATE_FILE)) return resume('pause was cleared (npm run chokidar:resume)');
-    if (keyHash() !== paused.keyHash) return resume('session key file changed');
+    if (keyHash() !== paused.keyHash) {
+      if (probing && child) killBot('session key file changed during a re-check');
+      probing = false;
+      return resume('session key file changed');
+    }
+    if (probing && child && !stoppingChild && Date.now() - startedAt > STARTUP_STALL_MS) {
+      killBot('key re-check did not finish signing in');
+    }
+    if (isAuthPause(paused) && !child && !probing && Date.now() - lastAuthProbeAt > AUTH_PROBE_MS) {
+      lastAuthProbeAt = Date.now();
+      probing = true;
+      log('Paused for a sign-in problem - re-checking whether claude.ai accepts the key now.');
+      startBot();
+      return;
+    }
     if (Date.now() - paused.lastEmailAt > REMINDER_MS) {
       paused.lastEmailAt = Date.now();
       writeState(paused);
@@ -464,6 +522,7 @@ async function main() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
   setInterval(tick, 15000);
+  setInterval(heartbeat, HEARTBEAT_MS);
 
   const saved = readState();
   if (saved && saved.keyHash === keyHash()) {
