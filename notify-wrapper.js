@@ -14,8 +14,9 @@
  *
  * Auth failures are retried for ~20 minutes first (1, 3, 5, 10 min apart), because
  * claude.ai sometimes shows its login page for a few minutes while the key is fine.
- * While paused for an auth reason the bot still re-checks the key every 15 minutes
- * and resumes by itself if claude.ai accepts it again.
+ * While paused (for any reason) the bot is re-tried every 15 minutes and resumes by
+ * itself once it signs in and completes a scan, e.g. after a network outage or a
+ * claude.ai problem clears.
  *
  * While paused, the bot stays stopped and a reminder goes out every 24h. It
  * resumes by itself when session-key.txt or .env changes (i.e. after
@@ -294,10 +295,6 @@ function onLine(line) {
     healthy = true;
     authFailures = 0;
     lastProgress = Date.now();
-    if (probing) {
-      probing = false;
-      resume('claude.ai accepted the session key again');
-    }
     if (announceRecovery) {
       announceRecovery = false;
       notify('Back online', 'The bot signed in to claude.ai again and is watching your sessions.', { includeLog: false });
@@ -312,6 +309,10 @@ function onLine(line) {
     lastProgress = lastScanOkAt = Date.now();
     failedScans = 0;
     trackTerminationFailures();
+    if (probing) {
+      probing = false;
+      resume('a re-check signed in and completed a scan');
+    }
   } else if (/Could not find the "Active sessions"|Could not identify the Active sessions table|unexpected columns|Scan error:/.test(line)) {
     lastProgress = Date.now();
     failedScans++;
@@ -361,7 +362,7 @@ function onExit(code, signal) {
 
   if (probing) {
     probing = false;
-    log(`Key re-check did not sign in; still paused, next re-check in ${AUTH_PROBE_MS / 60000} min.`);
+    log(`Re-check did not get a scan through; still paused, next re-check in ${AUTH_PROBE_MS / 60000} min.`);
     return;
   }
   if (shuttingDown || paused) return;
@@ -374,7 +375,7 @@ function onExit(code, signal) {
       ` This kept happening for about ${Math.round(AUTH_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) / 60000)} minutes.` +
       ' Either the session key was revoked/expired (someone used "Log out of all devices" or ended this session),' +
       ' or claude.ai is having a longer outage.\n\n' +
-      `The bot re-checks the key every ${AUTH_PROBE_MS / 60000} minutes and resumes by itself if it works again.` +
+      `The bot re-checks every ${AUTH_PROBE_MS / 60000} minutes and resumes by itself if it works again.` +
       ' If it is still paused after that, refresh the key: npm run session-key -- "<sk-ant-sid02-...>"';
     if (authFailures > AUTH_RETRY_DELAYS_MS.length) {
       pause(code === 2 ? 'Session key not accepted' : 'Logged out of claude.ai', why);
@@ -392,7 +393,8 @@ function onExit(code, signal) {
   const reason = killReason || `the bot process exited unexpectedly (code ${code}, signal ${signal})`;
   if (crashes.length >= MAX_CRASHES) {
     pause('Bot keeps failing - paused',
-      `The bot stopped ${crashes.length} times in the last ${CRASH_WINDOW_MS / 60000} minutes. Latest: ${reason}.`);
+      `The bot stopped ${crashes.length} times in the last ${CRASH_WINDOW_MS / 60000} minutes. Latest: ${reason}.\n\n` +
+      `It re-tries every ${AUTH_PROBE_MS / 60000} minutes and resumes by itself once a scan gets through.`);
     return;
   }
   const delay = 10000 * crashes.length;
@@ -433,11 +435,6 @@ function resume(why) {
   }
 }
 
-// Paused because claude.ai would not accept the key? The key is often fine and
-// claude.ai was just having a bad few minutes, so quietly try again now and then.
-function isAuthPause(p) {
-  return p && /session key|logged out/i.test(p.reason);
-}
 
 function heartbeat() {
   if (shuttingDown || paused) return;
@@ -457,12 +454,14 @@ function tick() {
       return resume('session key file changed');
     }
     if (probing && child && !stoppingChild && Date.now() - startedAt > STARTUP_STALL_MS) {
-      killBot('key re-check did not finish signing in');
+      killBot('re-check did not sign in and scan in time');
     }
-    if (isAuthPause(paused) && !child && !probing && Date.now() - lastAuthProbeAt > AUTH_PROBE_MS) {
+    // Whatever caused the pause (key, claude.ai outage, network loss, crash loop)
+    // may have cleared by itself, so quietly try again now and then.
+    if (!child && !probing && Date.now() - lastAuthProbeAt > AUTH_PROBE_MS) {
       lastAuthProbeAt = Date.now();
       probing = true;
-      log('Paused for a sign-in problem - re-checking whether claude.ai accepts the key now.');
+      log(`Paused (${paused.reason}) - re-checking whether the bot can sign in and scan now.`);
       startBot();
       return;
     }

@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude Chokidar network watchdog (restart networking, then reboot, if the VM loses its network)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /home/ubuntu/claude-chokidar/deploy/chokidar-netwatch.sh

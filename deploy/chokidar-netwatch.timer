@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Claude Chokidar network watchdog every minute
+
+[Timer]
+# Give a fresh boot time to bring the network up before counting failures.
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
