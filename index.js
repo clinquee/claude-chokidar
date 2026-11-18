@@ -321,11 +321,17 @@ async function firstVisible(page, candidates, timeoutMs = 5000) {
   return null;
 }
 
-// Any logout control is off-limits to the bot. The settings page carries a
-// plain "Log out" button (and, on some accounts, "Log out of all devices");
-// clicking either would end sessions this bot is meant to protect. Terminating
-// a single session is done through the row menu, which never says "log out".
+// Logout controls are off-limits to the bot. The page carries "Log out of all
+// devices" and the account menu's own "Log out"; clicking either would end
+// sessions this bot is meant to protect, including its own.
 const FORBIDDEN_CLICK_TEXT = /log\s*out|sign\s*out/i;
+
+// The one exception: ending a single other session. claude.ai labelled that
+// "Terminate" until Nov 2026 and now labels it "Log out" (row menu item, then a
+// "Log out of <device>?" dialog). Only an element labelled exactly this, which the
+// bot has checked sits in that row's menu or that dialog, is let through.
+const SINGLE_SESSION_ACTION = /^\s*(terminate|log\s*out)\s*$/i;
+const ALLOW_ATTR = 'data-chokidar-allow';
 
 /**
  * Install a capture-phase guard in the page that swallows any click on a
@@ -345,6 +351,9 @@ async function installLogoutGuard(page) {
         : null;
       if (!el) return;
       const label = (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+      // Tagged by the bot after it verified this is a single-session "Log out"
+      // (see SINGLE_SESSION_ACTION); never honoured for "... all devices".
+      if (el.hasAttribute('data-chokidar-allow') && !/all\s*devices|everywhere/i.test(label)) return;
       if (FORBIDDEN.test(label)) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -363,13 +372,31 @@ async function installLogoutGuard(page) {
 }
 
 // Click only after checking the element is not a "log out of all devices" control.
-async function safeClick(locator, what = 'element', clickOptions = {}) {
+// With { singleSession: true } a control labelled exactly "Terminate" or
+// "Log out" is allowed; the caller must already have checked where it sits.
+async function safeClick(locator, what = 'element', clickOptions = {}, { singleSession = false } = {}) {
+  await assertClickable(locator, what, singleSession);
+  await withAllowMark(locator, singleSession, () => locator.click(clickOptions));
+}
+
+async function assertClickable(locator, what, singleSession) {
   const label = ((await locator.innerText().catch(() => '')) + ' ' +
                  (await locator.getAttribute('aria-label').catch(() => '') || '')).trim();
+  if (singleSession && SINGLE_SESSION_ACTION.test(label)) return;
   if (FORBIDDEN_CLICK_TEXT.test(label)) {
-    throw new Error(`Refused to click ${what}: its label ("${label}") would log out all devices.`);
+    throw new Error(`Refused to click ${what}: its label ("${label}") would log out more than one session.`);
   }
-  await locator.click(clickOptions);
+}
+
+// Tag the element so the in-page guard lets this one click through, then untag.
+async function withAllowMark(locator, singleSession, fn) {
+  if (!singleSession) return fn();
+  await locator.evaluate((el, attr) => el.setAttribute(attr, '1'), ALLOW_ATTR).catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    await locator.evaluate((el, attr) => el.removeAttribute(attr), ALLOW_ATTR).catch(() => {});
+  }
 }
 
 /**
@@ -380,32 +407,44 @@ async function safeClick(locator, what = 'element', clickOptions = {}) {
  * devices" button, and a loose text match there would sign out every session,
  * protected ones included - so no such fallback exists here.
  */
-async function confirmTermination(page, timeoutMs = 8000) {
-  // Target the confirmation modal specifically: it is an alertdialog headed
-  // "Terminate session". The settings panel itself is also role="dialog", so an
-  // unfiltered lookup would land on the wrong element.
+async function confirmTermination(page, deviceText = '', timeoutMs = 8000) {
+  // Target the confirmation modal specifically: an alertdialog headed
+  // "Log out of <device>?" (formerly "Terminate session"). The settings panel
+  // itself is also role="dialog", so an unfiltered lookup would land on it.
+  const SINGLE = /terminate session|log\s*out of (?!all\b)/i;
   const dialog = await firstVisible(page, [
-    page.locator('[role="alertdialog"]').filter({ hasText: /terminate session/i }),
-    page.getByRole('alertdialog'),
-    page.locator('[role="dialog"]').filter({ hasText: /terminate session/i })
+    page.locator('[role="alertdialog"]').filter({ hasText: SINGLE }),
+    page.locator('[role="dialog"]').filter({ hasText: SINGLE }).filter({ hasNotText: /where you.re logged in|active sessions/i })
   ], timeoutMs);
 
   if (!dialog) return false;
 
+  const dialogText = (await dialog.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+  if (/all\s*devices|everywhere|all sessions/i.test(dialogText)) {
+    console.warn(`  --> Refusing a confirm dialog that would end more than one session: "${dialogText.slice(0, 120)}"`);
+    return false;
+  }
+  // "Log out of Chrome (Windows)?" must name the device of the row we chose.
+  const device = deviceText.replace(/\s*\bCurrent\b\s*/i, ' ').replace(/\s+/g, ' ').trim();
+  if (/log\s*out of/i.test(dialogText) && device && !dialogText.toLowerCase().includes(device.toLowerCase())) {
+    console.warn(`  --> Confirm dialog does not name "${device}": "${dialogText.slice(0, 120)}". Not confirming.`);
+    return false;
+  }
+
   const button = await firstVisible(page, [
-    dialog.getByRole('button', { name: /^\s*terminate\s*$/i }),
-    dialog.locator('button').filter({ hasText: /^\s*terminate\s*$/i })
+    dialog.getByRole('button', { name: SINGLE_SESSION_ACTION }),
+    dialog.locator('button').filter({ hasText: SINGLE_SESSION_ACTION })
   ], 4000);
 
   if (!button) return false;
 
   const label = (await button.innerText().catch(() => '')).trim();
-  if (!/^terminate$/i.test(label)) {
+  if (!SINGLE_SESSION_ACTION.test(label)) {
     console.warn(`  --> Refusing to click confirm button labelled "${label}".`);
     return false;
   }
 
-  await safeClick(button, 'the confirm button');
+  await clickOrActivate(button, 'the confirm button', { singleSession: true });
   return true;
 }
 
@@ -429,14 +468,16 @@ async function dismissCookieBanner(page) {
 
 // Click a control even when an overlay covers it: try a normal click first,
 // then fall back to keyboard activation, which ignores whatever is on top.
-async function clickOrActivate(locator, what) {
+async function clickOrActivate(locator, what, { singleSession = false } = {}) {
   try {
-    await safeClick(locator, what, { timeout: 8000 });
+    await safeClick(locator, what, { timeout: 8000 }, { singleSession });
   } catch (err) {
     if (/Refused to click/.test(err.message)) throw err;
     console.warn(`  --> Click on ${what} was blocked (${err.message.split('\n')[0]}); using the keyboard instead.`);
-    await locator.focus();
-    await locator.press('Enter');
+    await withAllowMark(locator, singleSession, async () => {
+      await locator.focus();
+      await locator.press('Enter');
+    });
   }
 }
 
@@ -699,24 +740,32 @@ async function performScan(page, options, checkNumber) {
           await clickOrActivate(actionBtn, 'the row action button');
           await page.waitForTimeout(500);
 
-          // Playwright rejects a selector list that mixes CSS with a `text=`
-          // engine, so each candidate is tried as its own locator.
+          // The item ("Log out" since Nov 2026, "Terminate" before) is looked
+          // for only inside the one menu this row's button just opened, never
+          // anywhere else on the page.
+          const openMenus = page.locator('[role="menu"]:visible');
+          const menuCount = await openMenus.count().catch(() => 0);
+          if (menuCount !== 1) {
+            await dismissDialog(page);
+            throw new Error(`Expected the row's action menu to be the only open menu, found ${menuCount}.`);
+          }
+          const menu = openMenus.first();
           const terminateItem = await firstVisible(page, [
-            page.getByRole('menuitem', { name: /terminate/i }),
-            page.locator('[role="menu"] button').filter({ hasText: /terminate/i }),
-            page.locator('[role="menuitem"]:has-text("Terminate")'),
-            page.locator('[data-part="item"]:has-text("Terminate")'),
-            page.getByText('Terminate', { exact: false })
+            menu.getByRole('menuitem', { name: SINGLE_SESSION_ACTION }),
+            menu.locator('button, [role="menuitem"]').filter({ hasText: SINGLE_SESSION_ACTION })
           ], 5000);
 
           if (!terminateItem) {
-            throw new Error('No "Terminate" menu item appeared.');
+            const items = (await menu.locator('[role="menuitem"], button').allInnerTexts().catch(() => []))
+              .map(t => t.trim()).filter(Boolean);
+            await dismissDialog(page);
+            throw new Error(`No "Log out"/"Terminate" item in the session menu (it shows: ${items.join(', ') || 'nothing'}).`);
           }
-          await clickOrActivate(terminateItem, 'the Terminate menu item');
+          await clickOrActivate(terminateItem, 'the session menu item', { singleSession: true });
           await page.waitForTimeout(500);
 
-          // Claude asks "Terminate session - are you sure?" before acting.
-          const confirmed = await confirmTermination(page);
+          // Claude asks "Log out of <device>?" before acting.
+          const confirmed = await confirmTermination(page, deviceText);
           if (!confirmed) {
             console.warn('  --> Could not confirm in the dialog; nothing was terminated.');
             await dismissDialog(page);
